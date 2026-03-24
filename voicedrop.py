@@ -7,7 +7,9 @@ import atexit
 import json
 import logging
 import os
+import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -15,6 +17,7 @@ import tempfile
 import threading
 import time
 import traceback
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +59,8 @@ APP_DIR = Path(__file__).resolve().parent
 STATE_DIR = Path.home() / "Library/Application Support/VoiceDrop"
 LOG_DIR = Path.home() / "Library/Logs/VoiceDrop"
 TRANSCRIPTS_DIR = Path.home() / "Desktop/VoiceDrop Transcripts"
+ARCHIVED_AUDIO_DIR = TRANSCRIPTS_DIR / "Audio"
+IN_PROGRESS_AUDIO_DIR = ARCHIVED_AUDIO_DIR / "InProgress"
 TERM_GLOSSARY_FILE = APP_DIR / "transcription_terms.json"
 PID_FILE = STATE_DIR / "voicedrop.pid"
 LAST_TRANSCRIPT_FILE = STATE_DIR / "last_transcript.txt"
@@ -65,6 +70,8 @@ SAMPLE_RATE = 16_000
 MIN_RECORDING_SECONDS = 0.35
 RIGHT_OPTION_KEYCODE = 61
 SPINNER_FRAMES = ("TX|", "TX/", "TX-", "TX\\")
+RECORDING_SEGMENT_SECONDS = 1.0
+AUDIO_ARCHIVE_BITRATE = os.getenv("VOICEDROP_AUDIO_BITRATE", "192k")
 SILENCE_RMS_THRESHOLD = 0.0035
 SILENCE_PEAK_THRESHOLD = 0.02
 SILENCE_ACTIVE_RATIO_THRESHOLD = 0.008
@@ -117,6 +124,8 @@ def ensure_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    IN_PROGRESS_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def setup_logging() -> None:
@@ -195,6 +204,11 @@ class NoSpeechDetectedError(RuntimeError):
     pass
 
 
+def float_audio_to_pcm16(audio: np.ndarray) -> np.ndarray:
+    clipped = np.clip(audio, -1.0, 1.0)
+    return np.round(clipped * 32767.0).astype(np.int16)
+
+
 def analyze_audio_levels(audio: np.ndarray) -> tuple[float, float, float]:
     if audio.size == 0:
         return 0.0, 0.0, 0.0
@@ -210,6 +224,20 @@ def is_effectively_silent(audio: np.ndarray) -> bool:
     peak, rms, active_ratio = analyze_audio_levels(audio)
     LOGGER.info(
         "Audio levels peak=%.4f rms=%.4f active_ratio=%.4f",
+        peak,
+        rms,
+        active_ratio,
+    )
+    return (
+        peak < SILENCE_PEAK_THRESHOLD
+        and rms < SILENCE_RMS_THRESHOLD
+        and active_ratio < SILENCE_ACTIVE_RATIO_THRESHOLD
+    )
+
+
+def is_effectively_silent_metrics(peak: float, rms: float, active_ratio: float) -> bool:
+    LOGGER.info(
+        "Audio stats peak=%.4f rms=%.4f active_ratio=%.4f",
         peak,
         rms,
         active_ratio,
@@ -336,15 +364,136 @@ def is_filtered_hallucination(text: str) -> bool:
 @dataclass
 class RecordingResult:
     duration_seconds: float
-    audio: np.ndarray
+    started_stamp: str
+    session_dir: Path
+    segment_paths: list[Path]
+    peak: float
+    rms: float
+    active_ratio: float
+
+
+class RollingAudioWriter:
+    def __init__(self, started_stamp: str) -> None:
+        self.started_stamp = started_stamp
+        self.session_dir = IN_PROGRESS_AUDIO_DIR / f"VoiceDrop_{started_stamp}.inprogress"
+        self.segments_dir = self.session_dir / "segments"
+        self.manifest_path = self.session_dir / "recording.json"
+        self.segment_frames = int(SAMPLE_RATE * RECORDING_SEGMENT_SECONDS)
+        self.segment_paths: list[Path] = []
+        self._queue: queue.Queue[np.ndarray | None] = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="audio-writer",
+            daemon=True,
+        )
+        self._buffer = np.empty(0, dtype=np.float32)
+        self._segment_index = 0
+
+    def start(self) -> None:
+        self.segments_dir.mkdir(parents=True, exist_ok=True)
+        self._write_manifest("recording")
+        self._thread.start()
+
+    def append_chunk(self, audio: np.ndarray) -> None:
+        self._queue.put(audio.astype(np.float32, copy=True))
+
+    def stop(self) -> list[Path]:
+        self._queue.put(None)
+        self._thread.join()
+        self._write_manifest(
+            "stopped",
+            {
+                "segment_count": len(self.segment_paths),
+                "segments": [path.name for path in self.segment_paths],
+            },
+        )
+        return list(self.segment_paths)
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            self._buffer = np.concatenate((self._buffer, item))
+            while self._buffer.size >= self.segment_frames:
+                self._write_segment(self._buffer[: self.segment_frames])
+                self._buffer = self._buffer[self.segment_frames :]
+
+        if self._buffer.size:
+            self._write_segment(self._buffer)
+            self._buffer = np.empty(0, dtype=np.float32)
+
+    def _write_segment(self, audio: np.ndarray) -> None:
+        segment_path = self.segments_dir / f"{self._segment_index:06d}.wav"
+        write_wav(segment_path, SAMPLE_RATE, float_audio_to_pcm16(audio))
+        self.segment_paths.append(segment_path)
+        self._segment_index += 1
+
+    def _write_manifest(self, status: str, extra: dict[str, object] | None = None) -> None:
+        payload: dict[str, object] = {
+            "status": status,
+            "started_stamp": self.started_stamp,
+            "sample_rate": SAMPLE_RATE,
+            "segment_seconds": RECORDING_SEGMENT_SECONDS,
+        }
+        if extra:
+            payload.update(extra)
+        self.manifest_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+def merge_wav_segments(segment_paths: list[Path], output_path: Path) -> None:
+    if not segment_paths:
+        raise RuntimeError("No audio segments were captured.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(output_path), "wb") as out_file:
+        out_file.setnchannels(1)
+        out_file.setsampwidth(2)
+        out_file.setframerate(SAMPLE_RATE)
+
+        for segment_path in segment_paths:
+            with wave.open(str(segment_path), "rb") as in_file:
+                out_file.writeframes(in_file.readframes(in_file.getnframes()))
+
+
+def encode_mp3_archive(input_wav: Path, output_mp3: Path) -> None:
+    output_mp3.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(input_wav),
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            AUDIO_ARCHIVE_BITRATE,
+            str(output_mp3),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
 
 
 class AudioRecorder:
     def __init__(self) -> None:
         self._stream: sd.InputStream | None = None
-        self._frames: list[np.ndarray] = []
         self._lock = threading.Lock()
         self._started_at: float | None = None
+        self._started_stamp: str | None = None
+        self._writer: RollingAudioWriter | None = None
+        self._peak = 0.0
+        self._sum_squares = 0.0
+        self._active_samples = 0
+        self._total_samples = 0
 
     @property
     def is_recording(self) -> bool:
@@ -353,13 +502,32 @@ class AudioRecorder:
     def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         if status:
             LOGGER.warning("Audio callback status: %s", status)
+        audio = indata.reshape(-1).astype(np.float32, copy=True)
+        abs_audio = np.abs(audio, dtype=np.float32)
+        peak = float(abs_audio.max(initial=0.0))
+        sum_squares = float(np.square(audio, dtype=np.float32).sum(dtype=np.float64))
+        active_samples = int(np.count_nonzero(abs_audio >= SILENCE_PEAK_THRESHOLD))
+
         with self._lock:
-            self._frames.append(indata.copy())
+            self._peak = max(self._peak, peak)
+            self._sum_squares += sum_squares
+            self._active_samples += active_samples
+            self._total_samples += int(audio.size)
+            writer = self._writer
+
+        if writer is not None:
+            writer.append_chunk(audio)
 
     def start(self) -> None:
         if self._stream is not None:
             raise RuntimeError("Recording already in progress")
-        self._frames = []
+        self._started_stamp = utc_timestamp()
+        self._writer = RollingAudioWriter(self._started_stamp)
+        self._writer.start()
+        self._peak = 0.0
+        self._sum_squares = 0.0
+        self._active_samples = 0
+        self._total_samples = 0
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
@@ -372,11 +540,18 @@ class AudioRecorder:
         LOGGER.info("Recording started")
 
     def stop(self) -> RecordingResult:
-        if self._stream is None or self._started_at is None:
+        if (
+            self._stream is None
+            or self._started_at is None
+            or self._started_stamp is None
+            or self._writer is None
+        ):
             raise RuntimeError("Recording is not active")
 
         stream = self._stream
         self._stream = None
+        writer = self._writer
+        self._writer = None
         try:
             stream.stop()
         finally:
@@ -384,18 +559,33 @@ class AudioRecorder:
 
         duration_seconds = time.time() - self._started_at
         self._started_at = None
+        started_stamp = self._started_stamp
+        self._started_stamp = None
+        segment_paths = writer.stop()
 
         with self._lock:
-            frames = self._frames[:]
-            self._frames = []
+            peak = self._peak
+            total_samples = self._total_samples
+            active_samples = self._active_samples
+            sum_squares = self._sum_squares
+            self._peak = 0.0
+            self._sum_squares = 0.0
+            self._active_samples = 0
+            self._total_samples = 0
 
-        if frames:
-            audio = np.concatenate(frames, axis=0).reshape(-1)
-        else:
-            audio = np.array([], dtype=np.float32)
+        rms = float(np.sqrt(sum_squares / total_samples)) if total_samples else 0.0
+        active_ratio = float(active_samples / total_samples) if total_samples else 0.0
 
         LOGGER.info("Recording stopped after %.2f seconds", duration_seconds)
-        return RecordingResult(duration_seconds=duration_seconds, audio=audio)
+        return RecordingResult(
+            duration_seconds=duration_seconds,
+            started_stamp=started_stamp,
+            session_dir=writer.session_dir,
+            segment_paths=segment_paths,
+            peak=peak,
+            rms=rms,
+            active_ratio=active_ratio,
+        )
 
 
 class Transcriber:
@@ -574,14 +764,42 @@ class Transcriber:
         raise RuntimeError("All transcription backends failed: " + " | ".join(errors))
 
 
-def save_recording(audio: np.ndarray) -> Path:
+def save_recording(recording: RecordingResult) -> tuple[Path, Path]:
     ensure_dirs()
-    clipped = np.clip(audio, -1.0, 1.0)
-    write_wav(LAST_AUDIO_FILE, SAMPLE_RATE, clipped)
-    temp_path = Path(tempfile.gettempdir()) / f"voicedrop_{utc_timestamp()}.wav"
-    write_wav(temp_path, SAMPLE_RATE, clipped)
-    LOGGER.info("Saved audio to %s", temp_path)
-    return temp_path
+    temp_path = Path(tempfile.gettempdir()) / f"voicedrop_{recording.started_stamp}.wav"
+    merge_wav_segments(recording.segment_paths, temp_path)
+    shutil.copyfile(temp_path, LAST_AUDIO_FILE)
+
+    archive_mp3_path = ARCHIVED_AUDIO_DIR / f"VoiceDrop_{recording.started_stamp}.mp3"
+    archive_wav_path = ARCHIVED_AUDIO_DIR / f"VoiceDrop_{recording.started_stamp}.wav"
+    archive_mp3_path.unlink(missing_ok=True)
+    archive_wav_path.unlink(missing_ok=True)
+
+    try:
+        encode_mp3_archive(temp_path, archive_mp3_path)
+        archive_path = archive_mp3_path
+    except Exception:
+        LOGGER.exception("Failed to encode MP3 archive; keeping WAV instead")
+        shutil.copyfile(temp_path, archive_wav_path)
+        archive_path = archive_wav_path
+
+    try:
+        shutil.rmtree(recording.session_dir)
+    except Exception:
+        LOGGER.exception("Failed to remove in-progress session: %s", recording.session_dir)
+
+    LOGGER.info("Saved merged audio to %s", temp_path)
+    LOGGER.info("Archived audio to %s", archive_path)
+    return temp_path, archive_path
+
+
+def cleanup_recording_session(recording: RecordingResult) -> None:
+    try:
+        shutil.rmtree(recording.session_dir)
+    except FileNotFoundError:
+        return
+    except Exception:
+        LOGGER.exception("Failed to clean up discarded session: %s", recording.session_dir)
 
 
 def save_transcript(text: str) -> Path:
@@ -774,6 +992,7 @@ class VoiceDropApp(rumps.App):
 
         self._start_shortcut_monitor()
         self._refresh_menu_state()
+        self._notify_recovery_sessions()
         self.transcriber.start_warmup()
         self._spinner_thread.start()
         send_notification("Ready", "VoiceDrop is running in the menu bar.")
@@ -847,6 +1066,21 @@ class VoiceDropApp(rumps.App):
         self.shortcut_monitor.start()
         LOGGER.info("Right Option shortcut monitor requested")
 
+    def _notify_recovery_sessions(self) -> None:
+        try:
+            sessions = sorted(IN_PROGRESS_AUDIO_DIR.glob("*.inprogress"))
+        except Exception:
+            LOGGER.exception("Failed to scan in-progress audio sessions")
+            return
+
+        if not sessions:
+            return
+
+        send_notification(
+            "Recovered audio fragments found",
+            f"{len(sessions)} unfinished recording folder(s) are in Audio/InProgress.",
+        )
+
     def _start_recording_impl(self, source: str) -> None:
         if self._transcribing:
             send_notification("Busy", "VoiceDrop is still transcribing the last recording.")
@@ -883,20 +1117,22 @@ class VoiceDropApp(rumps.App):
 
         self._refresh_menu_state()
 
-        if result.duration_seconds < MIN_RECORDING_SECONDS or result.audio.size == 0:
+        if result.duration_seconds < MIN_RECORDING_SECONDS or not result.segment_paths:
             LOGGER.info("Short recording discarded via %s", source)
+            cleanup_recording_session(result)
             self._set_title("VD")
             send_notification("Discarded", "Recording was too short.")
             return
 
-        if is_effectively_silent(result.audio):
+        if is_effectively_silent_metrics(result.peak, result.rms, result.active_ratio):
             LOGGER.info("Silent recording discarded via %s", source)
+            cleanup_recording_session(result)
             self._set_title("VD")
             send_notification("Discarded", "No speech was detected.")
             return
 
         try:
-            audio_path = save_recording(result.audio)
+            audio_path, archive_path = save_recording(result)
         except Exception as exc:
             LOGGER.exception("Failed to save recording")
             self._set_title("VD")
@@ -910,7 +1146,7 @@ class VoiceDropApp(rumps.App):
 
         self._transcription_thread = threading.Thread(
             target=self._transcribe_in_background,
-            args=(audio_path,),
+            args=(audio_path, archive_path),
             daemon=True,
             name="transcription",
         )
@@ -928,7 +1164,7 @@ class VoiceDropApp(rumps.App):
         else:
             self._start_recording_impl(source="shortcut")
 
-    def _transcribe_in_background(self, audio_path: Path) -> None:
+    def _transcribe_in_background(self, audio_path: Path, archive_path: Path) -> None:
         try:
             text, language, backend = self.transcriber.transcribe(audio_path)
             if not text:
@@ -950,12 +1186,12 @@ class VoiceDropApp(rumps.App):
             if pasted:
                 send_notification(
                     "Transcript saved and pasted",
-                    f"{transcript_path.name} ({language}, {backend})",
+                    f"{transcript_path.name} ({language}, {backend}) | audio: {archive_path.name}",
                 )
             else:
                 send_notification(
                     "Transcript saved",
-                    f"{transcript_path.name} ({language}, {backend}) | paste failed: {paste_error}",
+                    f"{transcript_path.name} ({language}, {backend}) | audio: {archive_path.name} | paste failed: {paste_error}",
                 )
         except NoSpeechDetectedError as exc:
             LOGGER.info("Recording discarded after transcription: %s", exc)
