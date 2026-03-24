@@ -1665,6 +1665,12 @@ def ensure_single_instance() -> None:
 
 
 def main() -> int:
+    try:
+        from AppKit import NSApplication
+        NSApplication.sharedApplication().setActivationPolicy_(2)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="VoiceDrop menu bar recorder")
     parser.add_argument("--self-check", action="store_true", help="print environment diagnostics")
     args = parser.parse_args()
