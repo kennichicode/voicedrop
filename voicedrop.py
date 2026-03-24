@@ -1,1122 +1,1007 @@
-#!/usr/bin/env python3
-"""VoiceDrop — Click-to-paste voice input for macOS"""
+#!/opt/homebrew/bin/python3.12
 
-import threading, subprocess, time, json, traceback, sys, multiprocessing, os, tempfile, re
+from __future__ import annotations
+
+import argparse
+import atexit
+import json
+import logging
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
 import numpy as np
-import sounddevice as sd
-import mlx_whisper
-from pynput import keyboard, mouse
 import rumps
-import objc
+import sounddevice as sd
+from AppKit import NSPasteboard, NSPasteboardTypeString
+from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
 from PyObjCTools import AppHelper
-from Foundation import NSObject, NSAttributedString
-from AppKit import (NSPanel, NSColor, NSView, NSBezierPath, NSFont,
-                    NSFontAttributeName, NSForegroundColorAttributeName,
-                    NSFloatingWindowLevel, NSWorkspace, NSImage, NSBitmapImageRep)
-
-# ── Waveform icon ────────────────────────────────
-_WAVEFORM_PNG_PATH = None
-
-def _build_waveform_png():
-    """DAW風縦バー波形をPNGファイルとして生成しパスを返す（アタック→減衰）"""
-    w, h = 28.0, 18.0
-    bars = [3, 7, 12, 16, 14, 10, 7, 5, 3]
-    bar_w, gap, cy = 2.0, 1.0, h / 2.0
-    img = NSImage.alloc().initWithSize_((w, h))
-    img.lockFocus()
-    NSColor.clearColor().set()
-    NSBezierPath.fillRect_(((0.0, 0.0), (w, h)))
-    NSColor.blackColor().setFill()
-    x = 1.0
-    for bh in bars:
-        bh = float(bh)
-        r = ((x, cy - bh / 2.0), (bar_w, bh))
-        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(r, 0.6, 0.6).fill()
-        x += bar_w + gap
-    img.unlockFocus()
-    tiff = img.TIFFRepresentation()
-    bitmap = NSBitmapImageRep.imageRepWithData_(tiff)
-    png_data = bitmap.representationUsingType_properties_(4, None)  # 4 = PNG
-    path = os.path.join(tempfile.gettempdir(), "voicedrop_waveform.png")
-    with open(path, 'wb') as f:
-        f.write(bytes(png_data))
-    return path
-
-
-# ── Audio / Model config ─────────────────────────
-MLX_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
-SAMPLE_RATE = 16000
-LANGUAGE    = "ja"
-MAX_RECORDING_SECONDS = 5 * 60
-TRANSCRIBE_CHUNK_SECONDS = 60
-FILE_SAVE_MINUTES_THRESHOLD = 3 * 60
-SILENCE_RMS_THRESHOLD = 0.003
-SILENCE_PEAK_THRESHOLD = 0.02
-PASTE_ARM_TIMEOUT_SECONDS = 20
-HOTKEY_STUCK_RESET_SECONDS = 1.2
-
-# ── Hotkey presets ───────────────────────────────
-MIC_VK = 176   # MacBook Air M1 マイクキー (Fn なし) の仮想キーコード
-
-HOTKEY_OPTIONS = [
-    ("右 Option キー  ⭐",      "right_option"),
-    ("右 ⌘ キー  ⭐",          "right_cmd"),
-    ("Ctrl+Shift+Space",      "ctrl_shift_space"),
-    ("Option+Space",          "opt_space"),
-    ("🎙  Mic Key  (Fn不要)",  "mic_key"),
-    ("F5  (Fn+マイク)",        "f5"),
-    ("F4",                    "f4"),
-    ("F6",                    "f6"),
-]
-
-# ── Config / app support files ───────────────────
-APP_SUPPORT_DIR = Path(tempfile.gettempdir()) / "VoiceDrop"
-LEGACY_CONFIG_PATH = Path.home() / ".voice-type" / "config.json"
-CONFIG_PATH = APP_SUPPORT_DIR / "config.json"
-TRANSCRIPT_DIR = Path.home() / "Desktop" / "VoiceDrop Transcripts"
-HISTORY_PATH = Path.home() / ".voice-type" / "history.json"
-HISTORY_MAX = 30
-DEFAULT_CFG = {"hotkey": "right_option"}
-config: dict = {}
-INSTANCE_LOCK_PATH = APP_SUPPORT_DIR / "app.lock"
-instance_lock_fp = None
-
-
-def log_exception(prefix):
-    print(f"[ERROR] {prefix}\n{traceback.format_exc()}", flush=True)
-
-
-def notify(title, subtitle="", message=""):
-    AppHelper.callAfter(rumps.notification, title, subtitle, message, False)
-
-
-def acquire_single_instance_lock():
-    global instance_lock_fp
-    INSTANCE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    instance_lock_fp = INSTANCE_LOCK_PATH.open("w")
-    try:
-        import fcntl
-        fcntl.flock(instance_lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        instance_lock_fp.write(str(os.getpid()) if 'os' in globals() else "")
-        instance_lock_fp.flush()
-        return True
-    except Exception:
-        return False
-
-def load_config():
-    global config
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not CONFIG_PATH.exists() and LEGACY_CONFIG_PATH.exists():
-        try:
-            CONFIG_PATH.write_text(LEGACY_CONFIG_PATH.read_text())
-        except Exception:
-            pass
-    if CONFIG_PATH.exists():
-        try:
-            config = {**DEFAULT_CFG, **json.loads(CONFIG_PATH.read_text())}
-        except Exception:
-            config = DEFAULT_CFG.copy()
-    else:
-        config = DEFAULT_CFG.copy()
-        CONFIG_PATH.write_text(json.dumps(config, indent=2))
-
-def save_config():
-    CONFIG_PATH.write_text(json.dumps(config, indent=2))
-
-# ── History ───────────────────────────────────────
-def load_history() -> list:
-    try:
-        if HISTORY_PATH.exists():
-            return json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return []
-
-def save_to_history(text: str):
-    history = load_history()
-    history.insert(0, {
-        "text": text,
-        "ts": datetime.now().strftime("%m/%d %H:%M"),
-    })
-    history = history[:HISTORY_MAX]
-    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    HISTORY_PATH.write_text(
-        json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-# ── State ────────────────────────────────────────
-model_ready    = threading.Event()
-is_recording   = False
-is_transcribing = False
-audio_buffer   = []
-audio_level    = 0.0
-stream         = None
-hotkey_active  = False
-current_keys   = set()
-recording_timer = None
-recording_started_at = 0.0
-stop_lock = threading.Lock()
-saved_mouse_x  = 0.0   # Quartz coords for click
-saved_mouse_y  = 0.0
-saved_appkit_x = 0.0   # AppKit coords for overlay
-saved_appkit_y = 0.0
-saved_frontmost_app_name = ""
-saved_frontmost_app_bundle_id = ""
-saved_frontmost_app_path = ""
-latest_click_x = 0.0
-latest_click_y = 0.0
-latest_click_app_name = ""
-latest_click_app_bundle_id = ""
-latest_click_app_path = ""
-click_target_ready = False
-pending_paste_armed = False
-pending_paste_expires_at = 0.0
-synthetic_click_in_progress = False
-hotkey_reset_timer = None
-transcription_state_lock = threading.Lock()
-transcription_seq = 0
-active_transcription_ids = set()
-discard_results_through_id = 0
-
-
-# ══════════════════════════════════════════════════
-#  Mic cursor overlay  (NSPanel floating near cursor)
-# ══════════════════════════════════════════════════
-_OVERLAY_W = 84
-_OVERLAY_H = 30
-
-class _MicBgView(NSView):
-    """Dark pill with red dot + REC label."""
-    def drawRect_(self, dirtyRect):
-        objc.super(_MicBgView, self).drawRect_(dirtyRect)
-        bounds = self.bounds()
-        w = bounds.size.width
-        h = bounds.size.height
-
-        # dark pill background
-        path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            bounds, h / 2, h / 2)
-        NSColor.colorWithCalibratedRed_green_blue_alpha_(
-            0.06, 0.06, 0.06, 0.90).setFill()
-        path.fill()
-
-        # red recording dot
-        dot_d = 8
-        dot_x = 14
-        dot_y = (h - dot_d) / 2
-        dot_path = NSBezierPath.bezierPathWithOvalInRect_(
-            ((dot_x, dot_y), (dot_d, dot_d)))
-        NSColor.colorWithCalibratedRed_green_blue_alpha_(
-            0.95, 0.22, 0.22, 1.0).setFill()
-        dot_path.fill()
-
-        # REC label
-        try:
-            attrs = {
-                NSFontAttributeName: NSFont.boldSystemFontOfSize_(12),
-                NSForegroundColorAttributeName: NSColor.whiteColor(),
-            }
-            s = NSAttributedString.alloc().initWithString_attributes_("REC", attrs)
-            sz = s.size()
-            x = dot_x + dot_d + 7
-            y = (h - sz.height) / 2
-            s.drawAtPoint_((x, y))
-        except Exception:
-            pass
-
-
-class MicOverlay(NSObject):
-    """Show/hide a floating mic badge near the cursor."""
-
-    def init(self):
-        self = objc.super(MicOverlay, self).init()
-        if self is None:
-            return None
-        self._panel = None
-        self._px    = 0.0
-        self._py    = 0.0
-        return self
-
-    @objc.python_method
-    def show_near(self, appkit_x, appkit_y):
-        """Thread-safe: dispatch show to main thread."""
-        # Offset: 18px right, 48px down (y decreases = visually down in AppKit)
-        self._px = appkit_x + 18
-        self._py = appkit_y - 58
-        self.performSelectorOnMainThread_withObject_waitUntilDone_(
-            b'_show:', None, False)
-
-    @objc.python_method
-    def hide(self):
-        """Thread-safe: dispatch hide to main thread."""
-        self.performSelectorOnMainThread_withObject_waitUntilDone_(
-            b'_hide:', None, False)
-
-    def _show_(self, _):
-        if self._panel is None:
-            rect = (0, 0, _OVERLAY_W, _OVERLAY_H)
-            # styleMask=0 → borderless; backing=2 → NSBackingStoreBuffered
-            self._panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-                rect, 0, 2, False)
-            self._panel.setBackgroundColor_(NSColor.clearColor())
-            self._panel.setOpaque_(False)
-            self._panel.setLevel_(NSFloatingWindowLevel + 2)
-            self._panel.setIgnoresMouseEvents_(True)
-            self._panel.setHasShadow_(False)
-            # show on all Spaces
-            self._panel.setCollectionBehavior_(1 << 0)  # CanJoinAllSpaces
-            view = _MicBgView.alloc().initWithFrame_(rect)
-            self._panel.setContentView_(view)
-
-        self._panel.setFrameOrigin_((self._px, self._py))
-        self._panel.orderFront_(None)
-
-    def _hide_(self, _):
-        if self._panel:
-            self._panel.orderOut_(None)
-
-
-overlay_ctrl: MicOverlay = None   # initialized in __main__
-
-
-# ══════════════════════════════════════════════════
-#  Menu Bar App  (clean, minimal UI)
-# ══════════════════════════════════════════════════
-class VoiceDropApp(rumps.App):
-
-    _REC_FRAMES   = ["● REC", "  REC"]
-    _SPIN_FRAMES  = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
-    def __init__(self):
-        super().__init__("VoiceDrop", title=None, quit_button=None)
-        self._anim_on  = False
-        self._anim_idx = 0
-
-        self._start_item = rumps.MenuItem("Start Recording", callback=self._start_recording)
-        self._stop_item = rumps.MenuItem("Stop & Transcribe", callback=self._stop_recording)
-        self._hotkey_status_item = rumps.MenuItem("Hotkey: starting...", callback=None)
-
-        self._hotkey_items = {}
-        hotkey_sub = rumps.MenuItem("Hotkey")
-        for label, key in HOTKEY_OPTIONS:
-            item = rumps.MenuItem(label, callback=self._on_hotkey_select)
-            hotkey_sub.update([item])
-            self._hotkey_items[label] = (item, key)
-
-        self._history_sub = rumps.MenuItem("📋  履歴")
-        self._history_map: dict[str, str] = {}
-
-        self.menu = [
-            self._start_item,
-            self._stop_item,
-            None,
-            self._history_sub,
-            None,
-            self._hotkey_status_item,
-            hotkey_sub,
-            None,
-            rumps.MenuItem("Quit", callback=self._quit),
-        ]
-        self._refresh_hotkey_menu()
-        self._refresh_recording_menu()
-        self._refresh_history_menu()
-        self._set_waveform_icon()
-
-    def _set_waveform_icon(self):
-        if _WAVEFORM_PNG_PATH is None:
-            self.title = "∿"
-            return
-        self._template = True           # フラグだけ先に立てる（reloadなし）
-        self.icon = _WAVEFORM_PNG_PATH  # アイコンを先にセット
-        self.title = None               # 最後にタイトルをクリア（fallbackOnNameが画像を見てOK）
-
-    def _set_title(self, title):
-        self.icon = None
-        self.title = title
-
-    def _refresh_history_menu(self):
-        # clear existing items
-        for key in list(self._history_sub.keys()):
-            del self._history_sub[key]
-        self._history_map = {}
-
-        history = load_history()
-        if not history:
-            placeholder = rumps.MenuItem("（履歴なし）", callback=None)
-            self._history_sub.update([placeholder])
-            return
-
-        for entry in history:
-            preview = entry["text"].replace("\n", " ")
-            label = f"{entry['ts']}  {preview[:42]}{'…' if len(preview) > 42 else ''}"
-            # ensure unique key (rumps uses title as key)
-            base, n = label, 1
-            while label in self._history_map:
-                label = f"{base} ({n})"
-                n += 1
-            self._history_map[label] = entry["text"]
-            item = rumps.MenuItem(label, callback=self._on_history_select)
-            self._history_sub.update([item])
-
-    def _on_history_select(self, sender):
-        text = self._history_map.get(sender.title)
-        if text:
-            _arm_click_to_paste(text)
-
-    def refresh_history(self):
-        """Call from background thread — dispatches to main thread."""
-        AppHelper.callAfter(self._refresh_history_menu)
-
-    def _refresh_hotkey_menu(self):
-        current = config.get("hotkey", "f5")
-        for label, (item, key) in self._hotkey_items.items():
-            item.title = ("✓  " + label) if key == current else ("     " + label)
-
-    def _on_hotkey_select(self, sender):
-        label = sender.title.strip().lstrip("✓").strip()
-        for lbl, key in HOTKEY_OPTIONS:
-            if lbl.strip() == label:
-                config["hotkey"] = key
-                save_config()
-                self._refresh_hotkey_menu()
-                notify(
-                    "VoiceDrop", "Hotkey changed",
-                    f"New hotkey: {lbl.strip()}  (restart to apply)",
-                )
-                break
-
-    def _quit(self, _):
-        rumps.quit_application()
-
-    def _start_recording(self, _):
-        if not model_ready.is_set() or is_recording:
-            return
-        _trigger()
-
-    def _stop_recording(self, _):
-        if not is_recording:
-            return
-        _trigger()
-
-    def _set_hotkey_status(self, text):
-        self._hotkey_status_item.title = text
-
-    def _refresh_recording_menu(self):
-        self._start_item.set_callback(self._start_recording)
-        self._stop_item.set_callback(self._stop_recording)
-        self._start_item.title = "Start Recording"
-        self._stop_item.title = "Stop & Transcribe"
-        self._start_item.state = 0
-        self._stop_item.state = 0
-        if is_recording:
-            self._start_item.title = "Start Recording (busy)"
-        else:
-            self._stop_item.title = "Stop & Transcribe (idle)"
-
-    def show_recording(self):
-        AppHelper.callAfter(self._show_recording)
-
-    def show_transcribing(self):
-        AppHelper.callAfter(self._show_transcribing)
-
-    def show_done(self):
-        AppHelper.callAfter(self._show_done)
-
-    def show_idle(self):
-        AppHelper.callAfter(self._show_idle)
-
-    def show_error(self, msg=""):
-        AppHelper.callAfter(self._show_error, msg)
-
-    def _show_recording(self):
-        self._anim_on  = True
-        self._anim_idx = 0
-        self._refresh_recording_menu()
-        self._animate_rec()
-
-    def _show_transcribing(self):
-        self._anim_on = False
-        self._anim_idx = 0
-        self._refresh_recording_menu()
-        self._animate_spin()
-
-    def _show_done(self):
-        self._anim_on = False
-        self._set_title("✓")
-        self._refresh_recording_menu()
-        AppHelper.callLater(2.0, self._show_idle)
-
-    def _show_idle(self):
-        self._anim_on = False
-        self._set_waveform_icon()
-        self._refresh_recording_menu()
-
-    def _show_error(self, msg=""):
-        self._anim_on = False
-        self._set_waveform_icon()
-        self._refresh_recording_menu()
-        if msg:
-            rumps.notification("VoiceDrop", "Error", msg, False)
-
-    def _animate_rec(self):
-        if not self._anim_on:
-            return
-        self._set_title(self._REC_FRAMES[self._anim_idx % 2])
-        self._anim_idx += 1
-        AppHelper.callLater(0.6, self._animate_rec)
-
-    def _animate_spin(self):
-        if self._anim_on:
-            return
-        # stop if another state already took over
-        if self.title not in self._SPIN_FRAMES and self._anim_idx > 0:
-            return
-        self._set_title(self._SPIN_FRAMES[self._anim_idx % len(self._SPIN_FRAMES)])
-        self._anim_idx += 1
-        AppHelper.callLater(0.1, self._animate_spin)
-
-
-# ══════════════════════════════════════════════════
-#  Accessibility check
-# ══════════════════════════════════════════════════
-def check_accessibility():
-    try:
-        import ctypes, ctypes.util
-        lib = ctypes.CDLL(ctypes.util.find_library("ApplicationServices"))
-        lib.AXIsProcessTrusted.restype = ctypes.c_bool
-        if lib.AXIsProcessTrusted():
-            if app:
-                app._set_hotkey_status("Hotkey: ready")
-            return True
-        if app:
-            app._set_hotkey_status("Hotkey: unavailable (use menu)")
-        notify(
-            "VoiceDrop — 設定が必要",
-            "アクセシビリティを許可してください",
-            "システム設定 → プライバシー → アクセシビリティで許可後、再起動してください",
-        )
-        return False
-    except Exception:
-        log_exception("check_accessibility failed")
-        if app:
-            app._set_hotkey_status("Hotkey: unavailable (use menu)")
-        return False
-
-
-# ══════════════════════════════════════════════════
-#  Quartz helpers
-# ══════════════════════════════════════════════════
-def _save_mouse_pos():
-    global saved_mouse_x, saved_mouse_y, saved_appkit_x, saved_appkit_y
-    global saved_frontmost_app_name, saved_frontmost_app_bundle_id, saved_frontmost_app_path
-    try:
-        import Quartz as Q
-        p = Q.CGEventGetLocation(Q.CGEventCreate(None))
-        h = Q.CGDisplayBounds(Q.CGMainDisplayID()).size.height
-        saved_mouse_x, saved_mouse_y = p.x, p.y
-        saved_appkit_x, saved_appkit_y = p.x, h - p.y
-        app_ref = NSWorkspace.sharedWorkspace().frontmostApplication()
-        saved_frontmost_app_name = app_ref.localizedName() if app_ref else ""
-        saved_frontmost_app_bundle_id = app_ref.bundleIdentifier() if app_ref else ""
-        bundle_url = app_ref.bundleURL() if app_ref else None
-        saved_frontmost_app_path = bundle_url.path() if bundle_url else ""
-    except Exception:
-        log_exception("failed to save mouse position")
-
-
-def _record_click_target(x, y):
-    global latest_click_x, latest_click_y, latest_click_app_name, click_target_ready
-    global latest_click_app_bundle_id, latest_click_app_path
-    try:
-        import Quartz as Q
-        latest_click_x, latest_click_y = x, y
-        app_ref = NSWorkspace.sharedWorkspace().frontmostApplication()
-        latest_click_app_name = app_ref.localizedName() if app_ref else ""
-        latest_click_app_bundle_id = app_ref.bundleIdentifier() if app_ref else ""
-        bundle_url = app_ref.bundleURL() if app_ref else None
-        latest_click_app_path = bundle_url.path() if bundle_url else ""
-        click_target_ready = True
-    except Exception:
-        log_exception("failed to record click target")
-
-
-def _clear_pending_paste():
-    global pending_paste_armed, pending_paste_expires_at
-    pending_paste_armed = False
-    pending_paste_expires_at = 0.0
-
-
-def on_click(x, y, button, pressed):
-    global pending_paste_armed
-    if not pressed:
-        return
-    if synthetic_click_in_progress:
-        return
-    if pending_paste_armed and pending_paste_expires_at and time.monotonic() > pending_paste_expires_at:
-        _clear_pending_paste()
-        return
-    if pending_paste_armed and not is_recording:
-        _record_click_target(x, y)
-        _clear_pending_paste()
-        threading.Thread(target=_paste_after_user_click, daemon=True).start()
-        return
-    if not is_recording:
-        return
-    _record_click_target(x, y)
-
-def _click_at_saved_pos():
-    try:
-        import Quartz as Q
-        pos = Q.CGPointMake(saved_mouse_x, saved_mouse_y)
-        for et in (Q.kCGEventLeftMouseDown, Q.kCGEventLeftMouseUp):
-            ev = Q.CGEventCreateMouseEvent(None, et, pos, Q.kCGMouseButtonLeft)
-            Q.CGEventSetFlags(ev, 0)
-            Q.CGEventPost(Q.kCGHIDEventTap, ev)
-            time.sleep(0.01)
-    except Exception:
-        pass
-
-
-def _click_at_latest_target():
-    if not click_target_ready:
-        return False
-    try:
-        import Quartz as Q
-        global synthetic_click_in_progress
-        synthetic_click_in_progress = True
-        pos = Q.CGPointMake(latest_click_x, latest_click_y)
-        for et in (Q.kCGEventLeftMouseDown, Q.kCGEventLeftMouseUp):
-            ev = Q.CGEventCreateMouseEvent(None, et, pos, Q.kCGMouseButtonLeft)
-            Q.CGEventSetFlags(ev, 0)
-            Q.CGEventPost(Q.kCGHIDEventTap, ev)
-            time.sleep(0.01)
-        synthetic_click_in_progress = False
-        return True
-    except Exception:
-        synthetic_click_in_progress = False
-        log_exception("failed to click latest target")
-        return False
-
-def _send_cmd_v():
-    try:
-        import Quartz as Q
-        for down in (True, False):
-            ev = Q.CGEventCreateKeyboardEvent(None, 9, down)
-            Q.CGEventSetFlags(ev, Q.kCGEventFlagMaskCommand)
-            Q.CGEventPost(Q.kCGHIDEventTap, ev)
-            time.sleep(0.01)
-        return True
-    except Exception:
-        return False
-
-
-def _activate_app(bundle_id="", app_path="", app_name=""):
-    try:
-        if bundle_id:
-            subprocess.run(["open", "-b", bundle_id], check=True)
-            time.sleep(0.2)
-            return True
-    except Exception:
-        pass
-
-    try:
-        if app_path:
-            subprocess.run(["open", "-a", app_path], check=True)
-            time.sleep(0.2)
-            return True
-    except Exception:
-        pass
-
-    if not app_name:
-        return False
-    try:
-        script = f'tell application "{app_name.replace(chr(34), chr(92) + chr(34))}" to activate'
-        subprocess.run(["osascript", "-e", script], check=True)
-        time.sleep(0.2)
-        return True
-    except Exception:
-        return False
-
-
-def _restore_target_app_focus():
-    if click_target_ready:
-        return _activate_app(
-            latest_click_app_bundle_id,
-            latest_click_app_path,
-            latest_click_app_name,
-        )
-    return _activate_app(
-        saved_frontmost_app_bundle_id,
-        saved_frontmost_app_path,
-        saved_frontmost_app_name,
-    )
-
-
-def _paste_at_saved_pos():
-    _restore_target_app_focus()
-    if not _click_at_latest_target():
-        _click_at_saved_pos()
-    time.sleep(0.2)
-    ok = _send_cmd_v()
-    return ok
-
-
-def _arm_click_to_paste(text):
-    global pending_paste_armed, pending_paste_expires_at
-    pending_paste_armed = True
-    pending_paste_expires_at = time.monotonic() + PASTE_ARM_TIMEOUT_SECONDS
-    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
-    notify(
-        "VoiceDrop",
-        "貼り付け待機中",
-        "貼り付けたい入力欄を1回クリックすると自動で貼り付けます",
-    )
-
-
-def _paste_after_user_click():
-    global click_target_ready
-    time.sleep(0.15)
-    try:
-        _activate_app(
-            latest_click_app_bundle_id,
-            latest_click_app_path,
-            latest_click_app_name,
-        )
-        ok = _send_cmd_v()
-        if app:
-            app.show_done()
-        if not ok:
-            notify(
-                "VoiceDrop",
-                "貼り付けに失敗",
-                "クリック先には自動貼り付けできませんでした。Cmd+V を試してください",
-            )
-    except Exception:
-        log_exception("deferred paste failed")
-        if app:
-            app.show_error("クリック後の貼り付けに失敗しました")
-    finally:
-        click_target_ready = False
-
-
-def _cancel_recording_timer():
-    global recording_timer
-    if recording_timer:
-        recording_timer.cancel()
-        recording_timer = None
-
-
-def _schedule_auto_stop():
-    global recording_timer
-    _cancel_recording_timer()
-    recording_timer = threading.Timer(MAX_RECORDING_SECONDS, _auto_stop_recording)
-    recording_timer.daemon = True
-    recording_timer.start()
-
-
-def _auto_stop_recording():
-    if not is_recording:
-        return
-    notify(
-        "VoiceDrop",
-        "5分で自動停止しました",
-        "文字起こしを開始します",
-    )
-    stop_and_transcribe(auto_stopped=True)
-
-
-def _transcript_path():
-    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    return TRANSCRIPT_DIR / f"VoiceDrop_{stamp}.txt"
-
-
-def _save_transcript_to_file(text):
-    path = _transcript_path()
-    path.write_text(text, encoding="utf-8")
-    return path
-
-
-# Whisper が無音・認識不能時に出力する定番ハルシネーション
-_HALLUCINATION_PHRASES = {
-    "ご視聴ありがとうございました",
-    "ありがとうございました",
-    "チャンネル登録よろしくお願いします",
-    "チャンネル登録お願いします",
-    "字幕は自動生成されています",
-    "Thank you for watching.",
-    "Thanks for watching.",
-    "Please subscribe.",
-    "MBC 뉴스 이덕영입니다",
+from Quartz import (
+    CFMachPortCreateRunLoopSource,
+    CFRunLoopAddSource,
+    CFRunLoopGetCurrent,
+    CFRunLoopRun,
+    CFRunLoopStop,
+    CGEventGetFlags,
+    CGEventGetIntegerValueField,
+    CGEventMaskBit,
+    CGEventSourceKeyState,
+    CGEventTapCreate,
+    CGEventTapEnable,
+    kCFRunLoopCommonModes,
+    kCGEventFlagMaskAlternate,
+    kCGEventFlagsChanged,
+    kCGEventTapDisabledByTimeout,
+    kCGEventTapDisabledByUserInput,
+    kCGEventTapOptionListenOnly,
+    kCGHeadInsertEventTap,
+    kCGKeyboardEventKeycode,
+    kCGSessionEventTap,
+    kCGEventSourceStateCombinedSessionState,
+)
+from scipy.io.wavfile import write as write_wav
+
+
+APP_NAME = "VoiceDrop"
+APP_DIR = Path(__file__).resolve().parent
+STATE_DIR = Path.home() / "Library/Application Support/VoiceDrop"
+LOG_DIR = Path.home() / "Library/Logs/VoiceDrop"
+TRANSCRIPTS_DIR = Path.home() / "Desktop/VoiceDrop Transcripts"
+TERM_GLOSSARY_FILE = APP_DIR / "transcription_terms.json"
+PID_FILE = STATE_DIR / "voicedrop.pid"
+LAST_TRANSCRIPT_FILE = STATE_DIR / "last_transcript.txt"
+LAST_AUDIO_FILE = STATE_DIR / "last_recording.wav"
+LOG_FILE = LOG_DIR / "voicedrop.log"
+SAMPLE_RATE = 16_000
+MIN_RECORDING_SECONDS = 0.35
+RIGHT_OPTION_KEYCODE = 61
+SPINNER_FRAMES = ("TX|", "TX/", "TX-", "TX\\")
+JAPANESE_TRANSCRIPTION_PROMPT = (
+    "以下は自然な日本語の音声文字起こしです。"
+    "句読点は「、」「。」を中心に自然に補い、"
+    "余計な半角スペースを入れずにそのまま日本語として出力してください。"
+)
+DEFAULT_TERM_GLOSSARY = {
+    "ボイスドロップ": "VoiceDrop",
+    "ボイス ドロップ": "VoiceDrop",
+    "ヴォイスドロップ": "VoiceDrop",
+    "ヴォイス ドロップ": "VoiceDrop",
+    "ボイス・ドロップ": "VoiceDrop",
+    "右オプションキー": "Right Option",
+    "ライトオプション": "Right Option",
+    "ライトオプションキー": "Right Option",
+    "ライト オプション": "Right Option",
+    "右オプション": "Right Option",
+    "オプションキー": "Option key",
 }
+CANONICAL_ENGLISH_REPLACEMENTS = (
+    (r"\bvoice\s+drop\b", "VoiceDrop"),
+    (r"右\s*Option key", "Right Option"),
+    (r"右\s*option key", "Right Option"),
+    (r"右\s*option", "Right Option"),
+    (r"\bright\s+option\b", "Right Option"),
+    (r"\boption\s+key\b", "Option key"),
+)
+JAPANESE_CHAR_PATTERN = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff々ー]")
 
-def _normalize_transcript_text(text: str) -> str:
-    return re.sub(r"[\s\u3000。、，,．.!！?？・…「」（）()]+", "", text).lower()
+LOGGER = logging.getLogger(APP_NAME)
 
-_NORMALIZED_HALLUCINATION_PHRASES = {
-    _normalize_transcript_text(phrase) for phrase in _HALLUCINATION_PHRASES
-}
 
-def _is_hallucination(text: str) -> bool:
-    t = text.strip()
-    if not t:
+def ensure_runtime_path() -> None:
+    current_parts = [part for part in os.environ.get("PATH", "").split(":") if part]
+    desired_prefixes = ["/opt/homebrew/bin", "/usr/local/bin"]
+    path_parts = desired_prefixes + [part for part in current_parts if part not in desired_prefixes]
+    os.environ["PATH"] = ":".join(path_parts)
+
+
+ensure_runtime_path()
+
+
+def ensure_dirs() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def setup_logging() -> None:
+    ensure_dirs()
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(threadName)s %(message)s"
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    root.addHandler(stream_handler)
+
+
+def write_pid_file() -> None:
+    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def remove_pid_file() -> None:
+    try:
+        if PID_FILE.exists() and PID_FILE.read_text(encoding="utf-8").strip() == str(
+            os.getpid()
+        ):
+            PID_FILE.unlink()
+    except Exception:
+        LOGGER.exception("Failed to remove PID file")
+
+
+def is_process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
         return True
-
-    normalized = _normalize_transcript_text(t)
-    if not normalized:
-        return True
-
-    if normalized in _NORMALIZED_HALLUCINATION_PHRASES:
-        return True
-
-    for phrase in _NORMALIZED_HALLUCINATION_PHRASES:
-        if phrase and phrase in normalized and len(normalized) <= max(len(phrase) * 2, len(phrase) + 8):
-            return True
-
-    return False
-
-
-def _is_pathologically_repetitive(text: str) -> bool:
-    normalized = _normalize_transcript_text(text)
-    if len(normalized) < 24:
+    except OSError:
         return False
 
-    if re.search(r"(.{2,12}?)\1{3,}", normalized):
-        return True
 
-    if re.search(r"(.)\1{7,}", normalized):
-        return True
-
-    return False
+def open_in_finder(path: Path) -> None:
+    subprocess.Popen(["open", str(path)])
 
 
-def _is_effectively_silent(audio) -> bool:
-    if len(audio) == 0:
-        return True
-    rms = float(np.sqrt(np.mean(np.square(audio))))
-    peak = float(np.max(np.abs(audio)))
-    return rms < SILENCE_RMS_THRESHOLD and peak < SILENCE_PEAK_THRESHOLD
+def send_notification(title: str, message: str) -> None:
+    try:
+        rumps.notification(APP_NAME, title, message)
+    except Exception:
+        LOGGER.exception("Notification failed: %s - %s", title, message)
 
 
-def _transcribe_audio_chunks(audio):
-    if _is_effectively_silent(audio):
-        return ""
-    result = mlx_whisper.transcribe(
-        audio,
-        path_or_hf_repo=MLX_MODEL_REPO,
-        language=LANGUAGE,
-        condition_on_previous_text=False,
-        hallucination_silence_threshold=0.2,
-        initial_prompt="以下は日本語の音声です。句読点（。、）を適切に含めて文字起こししてください。",
+def copy_to_clipboard(text: str) -> None:
+    pasteboard = NSPasteboard.generalPasteboard()
+    pasteboard.clearContents()
+    pasteboard.setString_forType_(text, NSPasteboardTypeString)
+
+
+def paste_into_focused_app() -> None:
+    script = 'tell application "System Events" to keystroke "v" using command down'
+    subprocess.run(
+        ["osascript", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
     )
-    text = result.get("text", "").strip()
-    if _is_hallucination(text) or _is_pathologically_repetitive(text):
-        return ""
+
+
+def utc_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def load_term_glossary() -> dict[str, str]:
+    glossary = dict(DEFAULT_TERM_GLOSSARY)
+
+    if not TERM_GLOSSARY_FILE.exists():
+        return glossary
+
+    try:
+        loaded = json.loads(TERM_GLOSSARY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        LOGGER.exception("Failed to read term glossary: %s", TERM_GLOSSARY_FILE)
+        return glossary
+
+    if not isinstance(loaded, dict):
+        LOGGER.warning("Ignoring invalid term glossary format: %s", TERM_GLOSSARY_FILE)
+        return glossary
+
+    for source, target in loaded.items():
+        if not isinstance(source, str) or not isinstance(target, str):
+            continue
+        source = source.strip()
+        target = target.strip()
+        if source and target:
+            glossary[source] = target
+
+    return glossary
+
+
+def build_initial_prompt(language: str, glossary: dict[str, str]) -> str:
+    prompt_parts: list[str] = []
+    if language == "ja":
+        prompt_parts.append(JAPANESE_TRANSCRIPTION_PROMPT)
+
+    if glossary:
+        examples = "、".join(
+            f"{source}->{target}"
+            for source, target in sorted(glossary.items(), key=lambda item: len(item[0]), reverse=True)[:8]
+        )
+        prompt_parts.append(
+            "固有名詞やカタカナ語は、既知のものは英字表記を優先してください。"
+            f"例: {examples}"
+        )
+
+    return " ".join(part for part in prompt_parts if part).strip()
+
+
+def apply_term_glossary(text: str, glossary: dict[str, str]) -> str:
+    normalized = text
+
+    for source, target in sorted(glossary.items(), key=lambda item: len(item[0]), reverse=True):
+        normalized = normalized.replace(source, target)
+
+    for pattern, replacement in CANONICAL_ENGLISH_REPLACEMENTS:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+
+    return normalized
+
+
+def normalize_transcript_text(text: str, language: str, glossary: dict[str, str] | None = None) -> str:
+    text = text.strip()
+    if not text:
+        return text
+
+    text = re.sub(r"[ \t]+", " ", text)
+
+    is_japanese = language == "ja" or bool(JAPANESE_CHAR_PATTERN.search(text))
+    if not is_japanese:
+        return text
+
+    text = text.replace("，", "、")
+    text = text.replace("､", "、")
+    text = text.replace(",", "、")
+    text = text.replace("｡", "。")
+    text = text.replace("．", "。")
+    text = text.replace("!", "！")
+    text = text.replace("?", "？")
+    text = text.replace(":", "：")
+    text = text.replace(";", "；")
+    text = re.sub(r"(?<!\d)\.(?!\d)", "。", text)
+
+    text = re.sub(r"\s*([、。！？：；])\s*", r"\1", text)
+    text = re.sub(
+        r"(?<=[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff々ー])\s+(?=[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff々ー])",
+        "",
+        text,
+    )
+    text = re.sub(r"([、。！？]){2,}", r"\1", text)
+
+    if JAPANESE_CHAR_PATTERN.search(text) and not re.search(r"[。！？]$", text):
+        text += "。"
+
+    if glossary:
+        text = apply_term_glossary(text, glossary)
+
     return text
 
 
-# ══════════════════════════════════════════════════
-#  Recording
-# ══════════════════════════════════════════════════
-app: VoiceDropApp = None
+@dataclass
+class RecordingResult:
+    duration_seconds: float
+    audio: np.ndarray
 
-def audio_callback(indata, frames, time_info, status):
-    global audio_level
-    if is_recording:
-        audio_buffer.extend(indata[:, 0].tolist())
-        audio_level = float(np.sqrt(np.mean(indata ** 2))) * 3.5
 
-def start_recording():
-    global is_recording, audio_buffer, stream, recording_started_at, click_target_ready, pending_paste_armed
+class AudioRecorder:
+    def __init__(self) -> None:
+        self._stream: sd.InputStream | None = None
+        self._frames: list[np.ndarray] = []
+        self._lock = threading.Lock()
+        self._started_at: float | None = None
+
+    @property
+    def is_recording(self) -> bool:
+        return self._stream is not None
+
+    def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        if status:
+            LOGGER.warning("Audio callback status: %s", status)
+        with self._lock:
+            self._frames.append(indata.copy())
+
+    def start(self) -> None:
+        if self._stream is not None:
+            raise RuntimeError("Recording already in progress")
+        self._frames = []
+        self._stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            callback=self._callback,
+            blocksize=0,
+        )
+        self._stream.start()
+        self._started_at = time.time()
+        LOGGER.info("Recording started")
+
+    def stop(self) -> RecordingResult:
+        if self._stream is None or self._started_at is None:
+            raise RuntimeError("Recording is not active")
+
+        stream = self._stream
+        self._stream = None
+        try:
+            stream.stop()
+        finally:
+            stream.close()
+
+        duration_seconds = time.time() - self._started_at
+        self._started_at = None
+
+        with self._lock:
+            frames = self._frames[:]
+            self._frames = []
+
+        if frames:
+            audio = np.concatenate(frames, axis=0).reshape(-1)
+        else:
+            audio = np.array([], dtype=np.float32)
+
+        LOGGER.info("Recording stopped after %.2f seconds", duration_seconds)
+        return RecordingResult(duration_seconds=duration_seconds, audio=audio)
+
+
+class Transcriber:
+    def __init__(self) -> None:
+        self._faster_model = None
+        self._faster_lock = threading.Lock()
+        self._warmup_started = False
+
+        self.faster_model_name = os.getenv("VOICEDROP_MODEL", "small")
+        self.faster_compute_type = os.getenv("VOICEDROP_COMPUTE_TYPE", "int8")
+        self.language = os.getenv("VOICEDROP_LANGUAGE", "ja")
+        self.term_glossary = load_term_glossary()
+        default_prompt = build_initial_prompt(self.language, self.term_glossary)
+        self.initial_prompt = os.getenv("VOICEDROP_INITIAL_PROMPT", default_prompt).strip()
+        self.mlx_model_name = os.getenv(
+            "VOICEDROP_MLX_MODEL", "mlx-community/whisper-large-v3-turbo"
+        )
+
+    def start_warmup(self) -> None:
+        if self._warmup_started:
+            return
+        self._warmup_started = True
+        thread = threading.Thread(
+            target=self._warmup_models, name="model-warmup", daemon=True
+        )
+        thread.start()
+
+    def _warmup_models(self) -> None:
+        try:
+            self._get_mlx_model()
+            LOGGER.info(
+                "Warmup finished with mlx-whisper model '%s'",
+                self.mlx_model_name,
+            )
+        except Exception:
+            LOGGER.exception("Warmup failed for mlx-whisper; faster-whisper fallback will remain")
+            try:
+                self._get_faster_model()
+                LOGGER.info(
+                    "Warmup finished with faster-whisper model '%s'",
+                    self.faster_model_name,
+                )
+            except Exception:
+                LOGGER.exception("Warmup failed for faster-whisper fallback")
+
+    def _get_mlx_model(self):
+        import mlx.core as mx
+        from mlx_whisper.load_models import load_model
+        from mlx_whisper.transcribe import ModelHolder
+
+        model = load_model(self.mlx_model_name, dtype=mx.float16)
+        ModelHolder.model = model
+        ModelHolder.model_path = self.mlx_model_name
+        return model
+
+    def _get_faster_model(self):
+        if self._faster_model is not None:
+            return self._faster_model
+
+        with self._faster_lock:
+            if self._faster_model is not None:
+                return self._faster_model
+            from faster_whisper import WhisperModel
+
+            LOGGER.info(
+                "Loading faster-whisper model '%s' (compute_type=%s)",
+                self.faster_model_name,
+                self.faster_compute_type,
+            )
+            self._faster_model = WhisperModel(
+                self.faster_model_name,
+                device="cpu",
+                compute_type=self.faster_compute_type,
+                cpu_threads=max(1, (os.cpu_count() or 4) - 1),
+                num_workers=1,
+            )
+            return self._faster_model
+
+    def _run_faster_whisper_pass(
+        self,
+        audio_path: Path,
+        *,
+        vad_filter: bool,
+        beam_size: int,
+        label: str,
+    ) -> tuple[str, str]:
+        model = self._get_faster_model()
+        LOGGER.info(
+            "Transcribing with faster-whisper (%s): %s",
+            label,
+            audio_path,
+        )
+        segments, info = model.transcribe(
+            str(audio_path),
+            language=self.language,
+            task="transcribe",
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            condition_on_previous_text=False,
+            initial_prompt=self.initial_prompt or None,
+        )
+        text = "".join(segment.text for segment in segments).strip()
+        language = getattr(info, "language", "unknown")
+        return text, language
+
+    def _transcribe_with_faster_whisper(self, audio_path: Path) -> tuple[str, str, str]:
+        attempts = [
+            {"vad_filter": True, "beam_size": 1, "label": "vad-on-fast"},
+            {"vad_filter": False, "beam_size": 1, "label": "vad-off-fast"},
+            {"vad_filter": False, "beam_size": 5, "label": "vad-off-beam5"},
+        ]
+
+        last_language = "unknown"
+        for attempt in attempts:
+            text, language = self._run_faster_whisper_pass(audio_path, **attempt)
+            last_language = language
+            if text:
+                return text, language, f"faster-whisper:{attempt['label']}"
+            LOGGER.warning(
+                "faster-whisper returned empty text for %s",
+                attempt["label"],
+            )
+
+        return "", last_language, "faster-whisper"
+
+    def _transcribe_with_mlx(self, audio_path: Path) -> tuple[str, str, str]:
+        import mlx_whisper
+
+        LOGGER.info("Transcribing with mlx-whisper: %s", audio_path)
+        result = mlx_whisper.transcribe(
+            str(audio_path),
+            path_or_hf_repo=self.mlx_model_name,
+            verbose=False,
+            language=self.language,
+            task="transcribe",
+            temperature=0.0,
+            condition_on_previous_text=False,
+            initial_prompt=self.initial_prompt or None,
+        )
+        text = str(result.get("text", "")).strip()
+        language = str(result.get("language", "unknown"))
+        return text, language, "mlx-whisper"
+
+    def transcribe(self, audio_path: Path) -> tuple[str, str, str]:
+        errors: list[str] = []
+        for backend in (self._transcribe_with_mlx, self._transcribe_with_faster_whisper):
+            try:
+                text, language, backend_name = backend(audio_path)
+                if text:
+                    normalized_text = normalize_transcript_text(
+                        text,
+                        language,
+                        glossary=self.term_glossary,
+                    )
+                    if normalized_text != text:
+                        LOGGER.info("Normalized transcript output for %s", language)
+                    text = normalized_text
+                    return text, language, backend_name
+                errors.append(f"{backend_name}: empty transcript")
+                LOGGER.warning("Backend returned empty transcript: %s", backend_name)
+            except Exception as exc:
+                backend_name = backend.__name__.replace("_transcribe_with_", "")
+                LOGGER.exception("Backend failed: %s", backend_name)
+                errors.append(f"{backend_name}: {exc}")
+        raise RuntimeError("All transcription backends failed: " + " | ".join(errors))
+
+
+def save_recording(audio: np.ndarray) -> Path:
+    ensure_dirs()
+    clipped = np.clip(audio, -1.0, 1.0)
+    write_wav(LAST_AUDIO_FILE, SAMPLE_RATE, clipped)
+    temp_path = Path(tempfile.gettempdir()) / f"voicedrop_{utc_timestamp()}.wav"
+    write_wav(temp_path, SAMPLE_RATE, clipped)
+    LOGGER.info("Saved audio to %s", temp_path)
+    return temp_path
+
+
+def save_transcript(text: str) -> Path:
+    ensure_dirs()
+    path = TRANSCRIPTS_DIR / f"VoiceDrop_{utc_timestamp()}.txt"
+    path.write_text(text + "\n", encoding="utf-8")
+    LAST_TRANSCRIPT_FILE.write_text(text, encoding="utf-8")
+    LOGGER.info("Saved transcript to %s", path)
+    return path
+
+
+def run_self_check() -> int:
+    setup_logging()
+    ensure_dirs()
+
+    result: dict[str, object] = {
+        "python": sys.executable,
+        "app_dir": str(APP_DIR),
+        "transcripts_dir": str(TRANSCRIPTS_DIR),
+        "log_file": str(LOG_FILE),
+        "shortcut_trusted": None,
+        "default_device": None,
+        "devices": [],
+        "imports": {},
+    }
+
+    for module_name in ("rumps", "sounddevice", "numpy", "scipy"):
+        try:
+            __import__(module_name)
+            result["imports"][module_name] = "ok"
+        except Exception as exc:
+            result["imports"][module_name] = f"error: {exc}"
+
+    for optional_name in ("faster_whisper", "mlx_whisper"):
+        try:
+            __import__(optional_name)
+            result["imports"][optional_name] = "ok"
+        except Exception as exc:
+            result["imports"][optional_name] = f"error: {exc}"
+
     try:
-        audio_buffer = []
-        is_recording = True
-        click_target_ready = False
-        _clear_pending_paste()
-        recording_started_at = time.monotonic()
-        stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                                 dtype="float32", callback=audio_callback)
-        stream.start()
-        _schedule_auto_stop()
-        if app:
-            app.show_recording()
-        if overlay_ctrl:
-            overlay_ctrl.show_near(saved_appkit_x, saved_appkit_y)
-    except Exception:
-        is_recording = False
-        if stream:
-            stream.stop(); stream.close(); stream = None
-        log_exception("start_recording failed")
-        if app:
-            app.show_error("録音を開始できませんでした")
+        result["shortcut_trusted"] = bool(
+            AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: False})
+        )
+    except Exception as exc:
+        result["shortcut_trusted"] = f"error: {exc}"
+
+    try:
+        devices = sd.query_devices()
+        result["devices"] = [str(device) for device in devices]
+        result["default_device"] = list(sd.default.device)
+    except Exception as exc:
+        result["audio_error"] = str(exc)
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
-def _begin_transcription():
-    global transcription_seq, is_transcribing
-    with transcription_state_lock:
-        transcription_seq += 1
-        tid = transcription_seq
-        active_transcription_ids.add(tid)
-        is_transcribing = True
-        return tid
+class RightOptionEventTap:
+    def __init__(self, on_press) -> None:
+        self.on_press = on_press
+        self._thread: threading.Thread | None = None
+        self._tap = None
+        self._run_loop = None
+        self._source = None
+        self._right_option_down = False
+
+    @property
+    def is_running(self) -> bool:
+        return self._tap is not None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="shortcut-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._run_loop is not None:
+            CFRunLoopStop(self._run_loop)
+
+    def _run(self) -> None:
+        try:
+            mask = CGEventMaskBit(kCGEventFlagsChanged)
+            self._tap = CGEventTapCreate(
+                kCGSessionEventTap,
+                kCGHeadInsertEventTap,
+                kCGEventTapOptionListenOnly,
+                mask,
+                self._callback,
+                None,
+            )
+            if self._tap is None:
+                LOGGER.error("Failed to create CGEventTap for Right Option shortcut")
+                return
+
+            self._source = CFMachPortCreateRunLoopSource(None, self._tap, 0)
+            self._run_loop = CFRunLoopGetCurrent()
+            CFRunLoopAddSource(self._run_loop, self._source, kCFRunLoopCommonModes)
+            CGEventTapEnable(self._tap, True)
+            LOGGER.info("Right Option CGEventTap started")
+            CFRunLoopRun()
+        except Exception:
+            LOGGER.exception("Right Option CGEventTap crashed")
+        finally:
+            self._tap = None
+            self._source = None
+            self._run_loop = None
+            self._right_option_down = False
+
+    def _callback(self, _proxy, event_type, event, _refcon):
+        if event_type in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput):
+            LOGGER.warning("Right Option CGEventTap was disabled; re-enabling")
+            if self._tap is not None:
+                CGEventTapEnable(self._tap, True)
+            return event
+
+        if event_type != kCGEventFlagsChanged:
+            return event
+
+        keycode = int(CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode))
+        if keycode != RIGHT_OPTION_KEYCODE:
+            return event
+
+        is_down = bool(
+            CGEventSourceKeyState(
+                kCGEventSourceStateCombinedSessionState, RIGHT_OPTION_KEYCODE
+            )
+        )
+        if not is_down:
+            is_down = bool(CGEventGetFlags(event) & kCGEventFlagMaskAlternate)
+
+        if is_down and not self._right_option_down:
+            self._right_option_down = True
+            LOGGER.info("Right Option shortcut pressed")
+            AppHelper.callAfter(self.on_press)
+        elif not is_down:
+            self._right_option_down = False
+
+        return event
 
 
-def _finish_transcription(tid):
-    global is_transcribing
-    with transcription_state_lock:
-        active_transcription_ids.discard(tid)
-        is_transcribing = bool(active_transcription_ids)
+class VoiceDropApp(rumps.App):
+    def __init__(self) -> None:
+        super().__init__(APP_NAME, title="VD", quit_button="Quit VoiceDrop")
+        self.recorder = AudioRecorder()
+        self.transcriber = Transcriber()
+        self._transcription_thread: threading.Thread | None = None
+        self._transcribing = False
+        self.shortcut_monitor = RightOptionEventTap(self.toggle_recording_from_shortcut)
+        self._spinner_thread = threading.Thread(
+            target=self._spinner_loop,
+            name="spinner",
+            daemon=True,
+        )
 
+        self.start_button = rumps.MenuItem("Start Recording", callback=self.start_recording)
+        self.stop_button = rumps.MenuItem("Stop Recording", callback=self.stop_recording)
+        self.shortcut_status_button = rumps.MenuItem(
+            "Shortcut: Right Option (toggle)", callback=self.show_shortcut_help
+        )
+        self.shortcut_permission_button = rumps.MenuItem(
+            "Request Shortcut Permission", callback=self.request_shortcut_permission
+        )
+        self.open_transcripts_button = rumps.MenuItem(
+            "Open Transcripts Folder", callback=self.open_transcripts
+        )
+        self.open_logs_button = rumps.MenuItem("Open Logs", callback=self.open_logs)
+        self.copy_last_button = rumps.MenuItem(
+            "Copy Last Transcript", callback=self.copy_last_transcript
+        )
+        self.self_check_button = rumps.MenuItem("Self Check", callback=self.self_check)
 
-def _discard_current_output():
-    global discard_results_through_id
-    _clear_pending_paste()
-    with transcription_state_lock:
-        discard_results_through_id = transcription_seq
+        self.menu = [
+            self.start_button,
+            self.stop_button,
+            None,
+            self.shortcut_status_button,
+            self.shortcut_permission_button,
+            None,
+            self.open_transcripts_button,
+            self.open_logs_button,
+            self.copy_last_button,
+            self.self_check_button,
+        ]
 
+        self._start_shortcut_monitor()
+        self._refresh_menu_state()
+        self.transcriber.start_warmup()
+        self._spinner_thread.start()
+        send_notification("Ready", "VoiceDrop is running in the menu bar.")
 
-def _should_drop_transcription_result(tid):
-    with transcription_state_lock:
-        return tid <= discard_results_through_id
+    def _set_title(self, value: str) -> None:
+        self.title = value
 
-def stop_and_transcribe(auto_stopped=False):
-    global is_recording, stream, audio_level
-    with stop_lock:
-        if not is_recording and stream is None:
+    def _spinner_loop(self) -> None:
+        index = 0
+        while True:
+            if self._transcribing:
+                AppHelper.callAfter(self._set_title, SPINNER_FRAMES[index % len(SPINNER_FRAMES)])
+                index += 1
+                time.sleep(0.12)
+            else:
+                index = 0
+                time.sleep(0.2)
+
+    def _refresh_menu_state(self) -> None:
+        shortcut_ready = self._shortcut_is_trusted() and self.shortcut_monitor.is_running
+        self.start_button.set_callback(self.start_recording)
+        self.stop_button.set_callback(self.stop_recording)
+        self.start_button.state = 0
+        self.stop_button.state = 1 if self.recorder.is_recording else 0
+
+        if self._transcribing:
+            self.start_button.title = "Transcribing in Background..."
+        elif self.recorder.is_recording:
+            self.start_button.title = "Recording in Progress..."
+        else:
+            self.start_button.title = "Start Recording"
+
+        self.stop_button.title = (
+            "Stop Recording" if self.recorder.is_recording else "Stop Recording (inactive)"
+        )
+        self.copy_last_button.title = (
+            "Copy Last Transcript"
+            if LAST_TRANSCRIPT_FILE.exists()
+            else "Copy Last Transcript (none yet)"
+        )
+        self.shortcut_status_button.title = (
+            "Shortcut: Right Option (toggle)"
+            if shortcut_ready
+            else "Shortcut: Right Option (permission needed)"
+        )
+        self.shortcut_permission_button.title = (
+            "Shortcut Permission OK"
+            if shortcut_ready
+            else "Request Shortcut Permission"
+        )
+
+    def _shortcut_is_trusted(self, prompt: bool = False) -> bool:
+        try:
+            return bool(
+                AXIsProcessTrustedWithOptions(
+                    {kAXTrustedCheckOptionPrompt: bool(prompt)}
+                )
+            )
+        except Exception:
+            LOGGER.exception("Failed to query Accessibility trust")
+            return False
+
+    def _start_shortcut_monitor(self) -> None:
+        if not self._shortcut_is_trusted():
+            LOGGER.warning("Right Option shortcut needs Accessibility permission")
+            send_notification(
+                "Shortcut permission needed",
+                "Allow Accessibility for VoiceDrop/Python to use the Right Option shortcut.",
+            )
+            return
+        self.shortcut_monitor.start()
+        LOGGER.info("Right Option shortcut monitor requested")
+
+    def _start_recording_impl(self, source: str) -> None:
+        if self._transcribing:
+            send_notification("Busy", "VoiceDrop is still transcribing the last recording.")
+            return
+        if self.recorder.is_recording:
+            send_notification("Already recording", "VoiceDrop is already recording.")
             return
 
-        is_recording = False
-        audio_level  = 0.0
-        _cancel_recording_timer()
-        _save_mouse_pos()
-        if stream:
-            stream.stop(); stream.close(); stream = None
-
-        # Hide overlay immediately when recording stops
-        if overlay_ctrl:
-            overlay_ctrl.hide()
-
-        audio = np.array(audio_buffer, dtype=np.float32)
-
-    if len(audio) < SAMPLE_RATE * 0.3:
-        if app:
-            app.show_idle()
-        return
-
-    transcription_id = _begin_transcription()
-
-    if app:
-        app.show_transcribing()
-
-    def _run():
         try:
-            text = _transcribe_audio_chunks(audio)
-            if _should_drop_transcription_result(transcription_id):
-                return
+            self.recorder.start()
+        except Exception as exc:
+            LOGGER.exception("Failed to start recording")
+            send_notification("Recording failed", str(exc))
+            return
+
+        LOGGER.info("Recording started via %s", source)
+        self._set_title("REC")
+        self._refresh_menu_state()
+        send_notification("Recording", "VoiceDrop is recording from the microphone.")
+
+    def start_recording(self, _) -> None:
+        self._start_recording_impl(source="menu")
+
+    def _stop_recording_impl(self, source: str) -> None:
+        if not self.recorder.is_recording:
+            send_notification("Not recording", "There is no active recording to stop.")
+            return
+        try:
+            result = self.recorder.stop()
+        except Exception as exc:
+            LOGGER.exception("Failed to stop recording")
+            send_notification("Stop failed", str(exc))
+            return
+
+        self._refresh_menu_state()
+
+        if result.duration_seconds < MIN_RECORDING_SECONDS or result.audio.size == 0:
+            LOGGER.info("Short recording discarded via %s", source)
+            self._set_title("VD")
+            send_notification("Discarded", "Recording was too short.")
+            return
+
+        try:
+            audio_path = save_recording(result.audio)
+        except Exception as exc:
+            LOGGER.exception("Failed to save recording")
+            self._set_title("VD")
+            send_notification("Save failed", str(exc))
+            return
+
+        LOGGER.info("Recording stopped via %s; starting transcription", source)
+        self._transcribing = True
+        self._set_title("TX")
+        self._refresh_menu_state()
+
+        self._transcription_thread = threading.Thread(
+            target=self._transcribe_in_background,
+            args=(audio_path,),
+            daemon=True,
+            name="transcription",
+        )
+        self._transcription_thread.start()
+
+    def stop_recording(self, _) -> None:
+        self._stop_recording_impl(source="menu")
+
+    def toggle_recording_from_shortcut(self) -> None:
+        if self._transcribing:
+            send_notification("Busy", "VoiceDrop is still transcribing the last recording.")
+            return
+        if self.recorder.is_recording:
+            self._stop_recording_impl(source="shortcut")
+        else:
+            self._start_recording_impl(source="shortcut")
+
+    def _transcribe_in_background(self, audio_path: Path) -> None:
+        try:
+            text, language, backend = self.transcriber.transcribe(audio_path)
             if not text:
-                if app and not is_recording:
-                    app.show_idle()
-                return
+                raise RuntimeError("No speech was detected in the recording.")
 
-            save_to_history(text)
-            if app:
-                app.refresh_history()
+            transcript_path = save_transcript(text)
+            copy_to_clipboard(text)
+            pasted = False
+            paste_error = None
+            try:
+                time.sleep(0.12)
+                paste_into_focused_app()
+                pasted = True
+                LOGGER.info("Transcript pasted into focused app")
+            except Exception as exc:
+                paste_error = exc
+                LOGGER.exception("Automatic paste failed")
 
-            should_save_to_file = len(audio) >= SAMPLE_RATE * FILE_SAVE_MINUTES_THRESHOLD
-
-            if should_save_to_file:
-                if _should_drop_transcription_result(transcription_id):
-                    return
-                path = _save_transcript_to_file(text)
-                if app and not is_recording:
-                    app.show_done()
-                notify(
-                    "VoiceDrop",
-                    "長文のためファイル保存しました",
-                    str(path),
+            if pasted:
+                send_notification(
+                    "Transcript saved and pasted",
+                    f"{transcript_path.name} ({language}, {backend})",
                 )
-                return
-
-            if _should_drop_transcription_result(transcription_id):
-                return
-            _arm_click_to_paste(text)
-            if app and not is_recording:
-                app.show_idle()
-            if auto_stopped and not _should_drop_transcription_result(transcription_id):
-                notify(
-                    "VoiceDrop",
-                    "自動停止しました",
-                    "次にクリックした場所へ貼り付け待機中です",
+            else:
+                send_notification(
+                    "Transcript saved",
+                    f"{transcript_path.name} ({language}, {backend}) | paste failed: {paste_error}",
                 )
-        except Exception:
-            log_exception("transcription flow failed")
-            if app and not _should_drop_transcription_result(transcription_id):
-                app.show_error("文字起こしまたは出力に失敗しました")
+        except Exception as exc:
+            LOGGER.exception("Transcription failed")
+            send_notification("Transcription failed", str(exc))
         finally:
-            _finish_transcription(transcription_id)
+            self._transcribing = False
+            self._set_title("VD")
+            self._refresh_menu_state()
+            try:
+                if audio_path.exists():
+                    audio_path.unlink()
+            except Exception:
+                LOGGER.exception("Failed to remove temp audio: %s", audio_path)
 
-    threading.Thread(target=_run, daemon=True).start()
+    def open_transcripts(self, _) -> None:
+        open_in_finder(TRANSCRIPTS_DIR)
+
+    def open_logs(self, _) -> None:
+        open_in_finder(LOG_DIR)
+
+    def copy_last_transcript(self, _) -> None:
+        if not LAST_TRANSCRIPT_FILE.exists():
+            send_notification("Nothing to copy", "No transcript has been created yet.")
+            return
+        text = LAST_TRANSCRIPT_FILE.read_text(encoding="utf-8").strip()
+        if not text:
+            send_notification("Nothing to copy", "The last transcript was empty.")
+            return
+        copy_to_clipboard(text)
+        send_notification("Copied", "The last transcript is now on the clipboard.")
+
+    def self_check(self, _) -> None:
+        try:
+            devices = sd.query_devices()
+            send_notification(
+                "Self check OK",
+                f"{len(devices)} audio devices detected. Log: {LOG_FILE.name}",
+            )
+        except Exception as exc:
+            send_notification("Self check failed", str(exc))
+
+    def show_shortcut_help(self, _) -> None:
+        if self._shortcut_is_trusted():
+            send_notification(
+                "Shortcut ready",
+                "Press Right Option once to start recording, and again to stop.",
+            )
+        else:
+            send_notification(
+                "Shortcut permission needed",
+                "Open System Settings and allow Accessibility for VoiceDrop/Python.",
+            )
+
+    def request_shortcut_permission(self, _) -> None:
+        if self._shortcut_is_trusted(prompt=True):
+            self._start_shortcut_monitor()
+            send_notification("Shortcut permission OK", "Right Option shortcut is ready.")
+        else:
+            send_notification(
+                "Permission requested",
+                "Approve Accessibility for VoiceDrop/Python, then try Right Option again.",
+            )
+        self._refresh_menu_state()
 
 
-# ══════════════════════════════════════════════════
-#  Hotkey listener
-# ══════════════════════════════════════════════════
-def _trigger():
-    if not model_ready.is_set():
+def handle_signal(signum: int, _frame) -> None:
+    LOGGER.info("Received signal %s; exiting", signum)
+    remove_pid_file()
+    rumps.quit_application()
+
+
+def ensure_single_instance() -> None:
+    if not PID_FILE.exists():
         return
-    if is_recording:
-        threading.Thread(target=stop_and_transcribe, daemon=True).start()
-        return
-    if is_transcribing or pending_paste_armed:
-        _discard_current_output()
-    threading.Thread(target=start_recording, daemon=True).start()
-def _alt_held():
-    return any(k in current_keys for k in
-               (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r))
-
-
-def _right_alt_pressed(key):
-    return key == keyboard.Key.alt_r
-
-
-def _cancel_hotkey_reset():
-    global hotkey_reset_timer
-    if hotkey_reset_timer:
-        hotkey_reset_timer.cancel()
-        hotkey_reset_timer = None
-
-
-def _clear_hotkey_state():
-    global hotkey_active
-    hotkey_active = False
-    current_keys.clear()
-    _cancel_hotkey_reset()
-
-
-def _schedule_hotkey_reset():
-    global hotkey_reset_timer
-    _cancel_hotkey_reset()
-    hotkey_reset_timer = threading.Timer(HOTKEY_STUCK_RESET_SECONDS, _clear_hotkey_state)
-    hotkey_reset_timer.daemon = True
-    hotkey_reset_timer.start()
-
-
-def _arm_hotkey_trigger():
-    global hotkey_active
-    hotkey_active = True
-    _schedule_hotkey_reset()
-    _trigger()
-
-def on_press(key):
-    current_keys.add(key)
-
-    hk = config.get("hotkey", "right_cmd")
-
-    if hk == "right_option":
-        if _right_alt_pressed(key) and not hotkey_active:
-            _arm_hotkey_trigger()
-    elif hk == "right_cmd":
-        if key == keyboard.Key.cmd_r and not hotkey_active:
-            _arm_hotkey_trigger()
-    elif hk == "opt_space":
-        is_space = (key == keyboard.Key.space or
-                    (hasattr(key, 'vk') and key.vk == 49) or
-                    (hasattr(key, 'char') and key.char in (' ', '\xa0')))
-        if is_space and _alt_held() and not hotkey_active:
-            _arm_hotkey_trigger()
-    elif hk == "ctrl_shift_space":
-        ctrl  = any(k in current_keys for k in
-                    (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r))
-        shift = any(k in current_keys for k in
-                    (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r))
-        space = keyboard.Key.space in current_keys
-        if ctrl and shift and space and not hotkey_active:
-            _arm_hotkey_trigger()
-    elif hk == "mic_key":
-        if key == keyboard.KeyCode(vk=MIC_VK) and not hotkey_active:
-            _arm_hotkey_trigger()
-    else:
-        target = getattr(keyboard.Key, hk, keyboard.Key.f5)
-        if key == target and not hotkey_active:
-            _arm_hotkey_trigger()
-
-def on_release(key):
-    global hotkey_active
-    current_keys.discard(key)
-    hk = config.get("hotkey", "right_cmd")
-    if hk == "right_option":
-        if _right_alt_pressed(key):
-            hotkey_active = False
-            _cancel_hotkey_reset()
-    elif hk == "right_cmd":
-        if key == keyboard.Key.cmd_r:
-            hotkey_active = False
-            _cancel_hotkey_reset()
-    elif hk == "opt_space":
-        if key in (keyboard.Key.space, keyboard.Key.alt,
-                   keyboard.Key.alt_l, keyboard.Key.alt_r):
-            if not (keyboard.Key.space in current_keys and _alt_held()):
-                hotkey_active = False
-                _cancel_hotkey_reset()
-    elif hk == "ctrl_shift_space":
-        ctrl  = any(k in current_keys for k in
-                    (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r))
-        shift = any(k in current_keys for k in
-                    (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r))
-        space = keyboard.Key.space in current_keys
-        if not (ctrl and shift and space):
-            hotkey_active = False
-            _cancel_hotkey_reset()
-    elif hk == "mic_key":
-        if key == keyboard.KeyCode(vk=MIC_VK):
-            hotkey_active = False
-            _cancel_hotkey_reset()
-    else:
-        target = getattr(keyboard.Key, hk, keyboard.Key.f5)
-        if key == target:
-            hotkey_active = False
-            _cancel_hotkey_reset()
-
-
-# ══════════════════════════════════════════════════
-#  Boot
-# ══════════════════════════════════════════════════
-def load_model():
     try:
-        # モデルをダウンロード＆キャッシュ、Neural Engine をウォームアップ
-        silent = np.zeros(SAMPLE_RATE, dtype=np.float32)
-        mlx_whisper.transcribe(silent, path_or_hf_repo=MLX_MODEL_REPO, language=LANGUAGE)
-        model_ready.set()
+        existing_pid = int(PID_FILE.read_text(encoding="utf-8").strip())
     except Exception:
-        log_exception("model load failed")
-        if app:
-            app.show_error("Whisper モデルの読込に失敗しました")
+        LOGGER.warning("Ignoring unreadable PID file: %s", PID_FILE)
+        return
+
+    if existing_pid != os.getpid() and is_process_alive(existing_pid):
+        LOGGER.info("VoiceDrop already running with PID %s", existing_pid)
+        raise SystemExit(0)
+
+    LOGGER.warning("Removing stale PID file for PID %s", existing_pid)
+    PID_FILE.unlink(missing_ok=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="VoiceDrop menu bar recorder")
+    parser.add_argument("--self-check", action="store_true", help="print environment diagnostics")
+    args = parser.parse_args()
+
+    if args.self_check:
+        return run_self_check()
+
+    setup_logging()
+    ensure_dirs()
+    ensure_single_instance()
+    write_pid_file()
+    atexit.register(remove_pid_file)
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    LOGGER.info("Starting %s from %s", APP_NAME, APP_DIR)
+    app = VoiceDropApp()
+    app.run()
+    return 0
+
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
-    load_config()
-    if not acquire_single_instance_lock():
-        sys.exit(0)
     try:
-        _WAVEFORM_PNG_PATH = _build_waveform_png()
+        raise SystemExit(main())
+    except SystemExit:
+        raise
     except Exception:
-        pass
-    app = VoiceDropApp()
-    overlay_ctrl = MicOverlay.alloc().init()
-
-    threading.Thread(target=check_accessibility, daemon=True).start()
-    threading.Thread(target=load_model, daemon=False).start()
-
-    def _listener():
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as lst:
-            lst.join()
-    threading.Thread(target=_listener, daemon=True).start()
-
-    def _mouse_listener():
-        with mouse.Listener(on_click=on_click) as lst:
-            lst.join()
-    threading.Thread(target=_mouse_listener, daemon=True).start()
-
-    app.run()
+        setup_logging()
+        LOGGER.error("Fatal error:\n%s", traceback.format_exc())
+        raise
