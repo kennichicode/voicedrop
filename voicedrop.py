@@ -65,6 +65,9 @@ SAMPLE_RATE = 16_000
 MIN_RECORDING_SECONDS = 0.35
 RIGHT_OPTION_KEYCODE = 61
 SPINNER_FRAMES = ("TX|", "TX/", "TX-", "TX\\")
+SILENCE_RMS_THRESHOLD = 0.0035
+SILENCE_PEAK_THRESHOLD = 0.02
+SILENCE_ACTIVE_RATIO_THRESHOLD = 0.008
 JAPANESE_TRANSCRIPTION_PROMPT = (
     "以下は自然な日本語の音声文字起こしです。"
     "句読点は「、」「。」を中心に自然に補い、"
@@ -92,6 +95,10 @@ CANONICAL_ENGLISH_REPLACEMENTS = (
     (r"\boption\s+key\b", "Option key"),
 )
 JAPANESE_CHAR_PATTERN = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff々ー]")
+HALLUCINATION_FILTER_PHRASES = {
+    "ご視聴ありがとうございます",
+    "ご視聴ありがとうございました",
+}
 
 LOGGER = logging.getLogger(APP_NAME)
 
@@ -182,6 +189,36 @@ def paste_into_focused_app() -> None:
 
 def utc_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+class NoSpeechDetectedError(RuntimeError):
+    pass
+
+
+def analyze_audio_levels(audio: np.ndarray) -> tuple[float, float, float]:
+    if audio.size == 0:
+        return 0.0, 0.0, 0.0
+
+    abs_audio = np.abs(audio.astype(np.float64, copy=False))
+    peak = float(abs_audio.max(initial=0.0))
+    rms = float(np.sqrt(np.mean(np.square(abs_audio), dtype=np.float64)))
+    active_ratio = float(np.mean(abs_audio >= SILENCE_PEAK_THRESHOLD))
+    return peak, rms, active_ratio
+
+
+def is_effectively_silent(audio: np.ndarray) -> bool:
+    peak, rms, active_ratio = analyze_audio_levels(audio)
+    LOGGER.info(
+        "Audio levels peak=%.4f rms=%.4f active_ratio=%.4f",
+        peak,
+        rms,
+        active_ratio,
+    )
+    return (
+        peak < SILENCE_PEAK_THRESHOLD
+        and rms < SILENCE_RMS_THRESHOLD
+        and active_ratio < SILENCE_ACTIVE_RATIO_THRESHOLD
+    )
 
 
 def load_term_glossary() -> dict[str, str]:
@@ -278,6 +315,22 @@ def normalize_transcript_text(text: str, language: str, glossary: dict[str, str]
         text = apply_term_glossary(text, glossary)
 
     return text
+
+
+def is_filtered_hallucination(text: str) -> bool:
+    collapsed = re.sub(r"[、。！？\s]+", "", text)
+    if not collapsed:
+        return True
+    if collapsed in HALLUCINATION_FILTER_PHRASES:
+        return True
+    # Whisper repetition hallucination: short pattern repeated many times
+    for length in range(1, 8):
+        if len(collapsed) >= length * 6:
+            pattern = collapsed[:length]
+            repetitions = len(collapsed) // length
+            if collapsed == pattern * repetitions:
+                return True
+    return False
 
 
 @dataclass
@@ -499,6 +552,13 @@ class Transcriber:
                     )
                     if normalized_text != text:
                         LOGGER.info("Normalized transcript output for %s", language)
+                    if is_filtered_hallucination(normalized_text):
+                        errors.append(f"{backend_name}: hallucination filter")
+                        LOGGER.warning(
+                            "Dropped transcript because it matched a filtered phrase: %s",
+                            normalized_text,
+                        )
+                        continue
                     text = normalized_text
                     return text, language, backend_name
                 errors.append(f"{backend_name}: empty transcript")
@@ -507,6 +567,10 @@ class Transcriber:
                 backend_name = backend.__name__.replace("_transcribe_with_", "")
                 LOGGER.exception("Backend failed: %s", backend_name)
                 errors.append(f"{backend_name}: {exc}")
+        if errors and all(
+            "empty transcript" in error or "hallucination filter" in error for error in errors
+        ):
+            raise NoSpeechDetectedError("No speech was detected in the recording.")
         raise RuntimeError("All transcription backends failed: " + " | ".join(errors))
 
 
@@ -825,6 +889,12 @@ class VoiceDropApp(rumps.App):
             send_notification("Discarded", "Recording was too short.")
             return
 
+        if is_effectively_silent(result.audio):
+            LOGGER.info("Silent recording discarded via %s", source)
+            self._set_title("VD")
+            send_notification("Discarded", "No speech was detected.")
+            return
+
         try:
             audio_path = save_recording(result.audio)
         except Exception as exc:
@@ -862,7 +932,7 @@ class VoiceDropApp(rumps.App):
         try:
             text, language, backend = self.transcriber.transcribe(audio_path)
             if not text:
-                raise RuntimeError("No speech was detected in the recording.")
+                raise NoSpeechDetectedError("No speech was detected in the recording.")
 
             transcript_path = save_transcript(text)
             copy_to_clipboard(text)
@@ -887,6 +957,9 @@ class VoiceDropApp(rumps.App):
                     "Transcript saved",
                     f"{transcript_path.name} ({language}, {backend}) | paste failed: {paste_error}",
                 )
+        except NoSpeechDetectedError as exc:
+            LOGGER.info("Recording discarded after transcription: %s", exc)
+            send_notification("Discarded", str(exc))
         except Exception as exc:
             LOGGER.exception("Transcription failed")
             send_notification("Transcription failed", str(exc))
