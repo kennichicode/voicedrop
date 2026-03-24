@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """VoiceDrop — Click-to-paste voice input for macOS"""
 
-import threading, subprocess, time, json, traceback, sys, multiprocessing, os, tempfile
+import threading, subprocess, time, json, traceback, sys, multiprocessing, os, tempfile, re
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -52,6 +52,8 @@ LANGUAGE    = "ja"
 MAX_RECORDING_SECONDS = 5 * 60
 TRANSCRIBE_CHUNK_SECONDS = 60
 FILE_SAVE_MINUTES_THRESHOLD = 3 * 60
+SILENCE_RMS_THRESHOLD = 0.003
+SILENCE_PEAK_THRESHOLD = 0.02
 
 # ── Hotkey presets ───────────────────────────────
 MIC_VK = 176   # MacBook Air M1 マイクキー (Fn なし) の仮想キーコード
@@ -478,14 +480,10 @@ def check_accessibility():
             return True
         if app:
             app._set_hotkey_status("Hotkey: unavailable (use menu)")
-        subprocess.run([
-            "open",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-        ])
         notify(
             "VoiceDrop — 設定が必要",
             "アクセシビリティを許可してください",
-            "システム設定 → プライバシー → アクセシビリティ → VoiceDrop を追加後、再起動",
+            "システム設定 → プライバシー → アクセシビリティで許可後、再起動してください",
         )
         return False
     except Exception:
@@ -691,12 +689,43 @@ _HALLUCINATION_PHRASES = {
     "MBC 뉴스 이덕영입니다",
 }
 
+def _normalize_transcript_text(text: str) -> str:
+    return re.sub(r"[\s\u3000。、，,．.!！?？・…「」（）()]+", "", text).lower()
+
+_NORMALIZED_HALLUCINATION_PHRASES = {
+    _normalize_transcript_text(phrase) for phrase in _HALLUCINATION_PHRASES
+}
+
 def _is_hallucination(text: str) -> bool:
     t = text.strip()
-    return t in _HALLUCINATION_PHRASES or not t
+    if not t:
+        return True
+
+    normalized = _normalize_transcript_text(t)
+    if not normalized:
+        return True
+
+    if normalized in _NORMALIZED_HALLUCINATION_PHRASES:
+        return True
+
+    for phrase in _NORMALIZED_HALLUCINATION_PHRASES:
+        if phrase and phrase in normalized and len(normalized) <= max(len(phrase) * 2, len(phrase) + 8):
+            return True
+
+    return False
+
+
+def _is_effectively_silent(audio) -> bool:
+    if len(audio) == 0:
+        return True
+    rms = float(np.sqrt(np.mean(np.square(audio))))
+    peak = float(np.max(np.abs(audio)))
+    return rms < SILENCE_RMS_THRESHOLD and peak < SILENCE_PEAK_THRESHOLD
 
 
 def _transcribe_audio_chunks(audio):
+    if _is_effectively_silent(audio):
+        return ""
     result = mlx_whisper.transcribe(
         audio,
         path_or_hf_repo=MLX_MODEL_REPO,
