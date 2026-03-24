@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import itertools
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ import threading
 import time
 import traceback
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -61,6 +62,11 @@ LOG_DIR = Path.home() / "Library/Logs/VoiceDrop"
 TRANSCRIPTS_DIR = Path.home() / "Desktop/VoiceDrop Transcripts"
 ARCHIVED_AUDIO_DIR = TRANSCRIPTS_DIR / "Audio"
 IN_PROGRESS_AUDIO_DIR = ARCHIVED_AUDIO_DIR / "InProgress"
+IMPORT_ROOT_DIR = TRANSCRIPTS_DIR / "Import"
+IMPORT_INBOX_DIR = IMPORT_ROOT_DIR / "Inbox"
+IMPORT_PROCESSING_DIR = IMPORT_ROOT_DIR / "Processing"
+IMPORT_PROCESSED_DIR = IMPORT_ROOT_DIR / "Processed"
+IMPORT_FAILED_DIR = IMPORT_ROOT_DIR / "Failed"
 TERM_GLOSSARY_FILE = APP_DIR / "transcription_terms.json"
 PID_FILE = STATE_DIR / "voicedrop.pid"
 LAST_TRANSCRIPT_FILE = STATE_DIR / "last_transcript.txt"
@@ -72,6 +78,8 @@ RIGHT_OPTION_KEYCODE = 61
 SPINNER_FRAMES = ("TX|", "TX/", "TX-", "TX\\")
 RECORDING_SEGMENT_SECONDS = 1.0
 AUDIO_ARCHIVE_BITRATE = os.getenv("VOICEDROP_AUDIO_BITRATE", "192k")
+IMPORT_SCAN_INTERVAL_SECONDS = 3.0
+IMPORT_STABILITY_SECONDS = 2.0
 SILENCE_RMS_THRESHOLD = 0.0035
 SILENCE_PEAK_THRESHOLD = 0.02
 SILENCE_ACTIVE_RATIO_THRESHOLD = 0.008
@@ -106,6 +114,17 @@ HALLUCINATION_FILTER_PHRASES = {
     "ご視聴ありがとうございます",
     "ご視聴ありがとうございました",
 }
+SUPPORTED_IMPORT_EXTENSIONS = {
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".flac",
+    ".caf",
+    ".aiff",
+    ".aif",
+    ".m4b",
+}
 
 LOGGER = logging.getLogger(APP_NAME)
 
@@ -126,6 +145,10 @@ def ensure_dirs() -> None:
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     ARCHIVED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     IN_PROGRESS_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    IMPORT_INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    IMPORT_PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
+    IMPORT_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    IMPORT_FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def setup_logging() -> None:
@@ -372,6 +395,17 @@ class RecordingResult:
     active_ratio: float
 
 
+@dataclass(order=True)
+class TranscriptionJob:
+    priority: int
+    sequence: int
+    kind: str = field(compare=False)
+    audio_path: Path = field(compare=False)
+    stamp: str = field(compare=False)
+    source_path: Path | None = field(compare=False, default=None)
+    archive_path: Path | None = field(compare=False, default=None)
+
+
 class RollingAudioWriter:
     def __init__(self, started_stamp: str) -> None:
         self.started_stamp = started_stamp
@@ -481,6 +515,46 @@ def encode_mp3_archive(input_wav: Path, output_mp3: Path) -> None:
         text=True,
         timeout=120,
     )
+
+
+def sanitize_filename_component(text: str, fallback: str = "item", max_length: int = 40) -> str:
+    normalized = re.sub(r"\s+", "_", text.strip())
+    normalized = re.sub(r"[^\w\-]+", "_", normalized, flags=re.UNICODE)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    if not normalized:
+        normalized = fallback
+    return normalized[:max_length]
+
+
+def build_transcript_label(text: str, fallback: str = "speech") -> str:
+    sentence = re.split(r"[\n。！？.!?]", text, maxsplit=1)[0].strip()
+    return sanitize_filename_component(sentence, fallback=fallback, max_length=32)
+
+
+def make_unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    counter = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}_{counter}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def make_unique_dir(path: Path) -> Path:
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=False)
+        return path
+
+    counter = 2
+    while True:
+        candidate = path.with_name(f"{path.name}_{counter}")
+        if not candidate.exists():
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        counter += 1
 
 
 class AudioRecorder:
@@ -802,13 +876,71 @@ def cleanup_recording_session(recording: RecordingResult) -> None:
         LOGGER.exception("Failed to clean up discarded session: %s", recording.session_dir)
 
 
-def save_transcript(text: str) -> Path:
+def save_transcript(
+    text: str,
+    *,
+    stamp: str | None = None,
+    label: str | None = None,
+    directory: Path | None = None,
+) -> Path:
     ensure_dirs()
-    path = TRANSCRIPTS_DIR / f"VoiceDrop_{utc_timestamp()}.txt"
+    stamp = stamp or utc_timestamp()
+    directory = directory or TRANSCRIPTS_DIR
+    base_name = f"VoiceDrop_{stamp}"
+    if label:
+        base_name += f"_{sanitize_filename_component(label, fallback='speech', max_length=32)}"
+    path = make_unique_path(directory / f"{base_name}.txt")
     path.write_text(text + "\n", encoding="utf-8")
     LAST_TRANSCRIPT_FILE.write_text(text, encoding="utf-8")
     LOGGER.info("Saved transcript to %s", path)
     return path
+
+
+def save_metadata(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def reserve_import_processing_path(source_path: Path) -> tuple[str, Path]:
+    ensure_dirs()
+    stamp = utc_timestamp()
+    label = sanitize_filename_component(source_path.stem, fallback="import", max_length=32)
+    processing_path = make_unique_path(
+        IMPORT_PROCESSING_DIR / f"{stamp}_{label}{source_path.suffix.lower()}"
+    )
+    return stamp, processing_path
+
+
+def finalize_import_audio(source_path: Path, output_dir: Path) -> tuple[Path, bool]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if source_path.suffix.lower() == ".mp3":
+        final_path = output_dir / "audio.mp3"
+        shutil.move(str(source_path), str(final_path))
+        return final_path, True
+
+    final_mp3_path = output_dir / "audio.mp3"
+    try:
+        encode_mp3_archive(source_path, final_mp3_path)
+        if final_mp3_path.exists() and final_mp3_path.stat().st_size > 0:
+            source_path.unlink(missing_ok=True)
+            return final_mp3_path, True
+        raise RuntimeError("Encoded MP3 file is missing or empty")
+    except Exception:
+        LOGGER.exception("Failed to convert imported audio to MP3: %s", source_path)
+        original_path = output_dir / f"original{source_path.suffix.lower()}"
+        shutil.move(str(source_path), str(original_path))
+        final_mp3_path.unlink(missing_ok=True)
+        return original_path, False
+
+
+def move_failed_import(source_path: Path, stamp: str, reason: str) -> Path:
+    ensure_dirs()
+    label = sanitize_filename_component(source_path.stem, fallback="failed", max_length=32)
+    failed_dir = make_unique_dir(IMPORT_FAILED_DIR / f"{stamp}_{label}")
+    if source_path.exists():
+        destination = failed_dir / source_path.name
+        shutil.move(str(source_path), str(destination))
+    (failed_dir / "error.txt").write_text(reason + "\n", encoding="utf-8")
+    return failed_dir
 
 
 def run_self_check() -> int:
@@ -951,17 +1083,35 @@ class VoiceDropApp(rumps.App):
         super().__init__(APP_NAME, title="VD", quit_button="Quit VoiceDrop")
         self.recorder = AudioRecorder()
         self.transcriber = Transcriber()
-        self._transcription_thread: threading.Thread | None = None
-        self._transcribing = False
+        self._job_queue: queue.PriorityQueue[TranscriptionJob] = queue.PriorityQueue()
+        self._job_counter = itertools.count()
+        self._job_state_lock = threading.Lock()
+        self._queued_job_count = 0
+        self._active_job: TranscriptionJob | None = None
+        self._queued_import_paths: set[str] = set()
+        self._import_observations: dict[str, tuple[int, int]] = {}
         self.shortcut_monitor = RightOptionEventTap(self.toggle_recording_from_shortcut)
         self._spinner_thread = threading.Thread(
             target=self._spinner_loop,
             name="spinner",
             daemon=True,
         )
+        self._worker_thread = threading.Thread(
+            target=self._transcription_worker_loop,
+            name="transcription-worker",
+            daemon=True,
+        )
+        self._import_watch_thread = threading.Thread(
+            target=self._import_watch_loop,
+            name="import-watch",
+            daemon=True,
+        )
 
         self.start_button = rumps.MenuItem("Start Recording", callback=self.start_recording)
         self.stop_button = rumps.MenuItem("Stop Recording", callback=self.stop_recording)
+        self.queue_status_button = rumps.MenuItem(
+            "Queue: idle", callback=self.scan_import_inbox_now
+        )
         self.shortcut_status_button = rumps.MenuItem(
             "Shortcut: Right Option (toggle)", callback=self.show_shortcut_help
         )
@@ -970,6 +1120,15 @@ class VoiceDropApp(rumps.App):
         )
         self.open_transcripts_button = rumps.MenuItem(
             "Open Transcripts Folder", callback=self.open_transcripts
+        )
+        self.open_import_inbox_button = rumps.MenuItem(
+            "Open Import Inbox", callback=self.open_import_inbox
+        )
+        self.open_import_processed_button = rumps.MenuItem(
+            "Open Imported Jobs", callback=self.open_import_processed
+        )
+        self.open_import_failed_button = rumps.MenuItem(
+            "Open Import Failed", callback=self.open_import_failed
         )
         self.open_logs_button = rumps.MenuItem("Open Logs", callback=self.open_logs)
         self.copy_last_button = rumps.MenuItem(
@@ -980,6 +1139,11 @@ class VoiceDropApp(rumps.App):
         self.menu = [
             self.start_button,
             self.stop_button,
+            None,
+            self.queue_status_button,
+            self.open_import_inbox_button,
+            self.open_import_processed_button,
+            self.open_import_failed_button,
             None,
             self.shortcut_status_button,
             self.shortcut_permission_button,
@@ -993,6 +1157,9 @@ class VoiceDropApp(rumps.App):
         self._start_shortcut_monitor()
         self._refresh_menu_state()
         self._notify_recovery_sessions()
+        self._worker_thread.start()
+        self._recover_pending_imports()
+        self._import_watch_thread.start()
         self.transcriber.start_warmup()
         self._spinner_thread.start()
         send_notification("Ready", "VoiceDrop is running in the menu bar.")
@@ -1000,11 +1167,26 @@ class VoiceDropApp(rumps.App):
     def _set_title(self, value: str) -> None:
         self.title = value
 
+    def _queue_state(self) -> tuple[int, TranscriptionJob | None]:
+        with self._job_state_lock:
+            return self._queued_job_count, self._active_job
+
+    def _has_pending_work(self) -> bool:
+        queued_count, active_job = self._queue_state()
+        return queued_count > 0 or active_job is not None
+
     def _spinner_loop(self) -> None:
         index = 0
         while True:
-            if self._transcribing:
-                AppHelper.callAfter(self._set_title, SPINNER_FRAMES[index % len(SPINNER_FRAMES)])
+            if self.recorder.is_recording:
+                index = 0
+                time.sleep(0.1)
+                continue
+            if self._has_pending_work():
+                AppHelper.callAfter(
+                    self._set_title,
+                    SPINNER_FRAMES[index % len(SPINNER_FRAMES)],
+                )
                 index += 1
                 time.sleep(0.12)
             else:
@@ -1013,14 +1195,13 @@ class VoiceDropApp(rumps.App):
 
     def _refresh_menu_state(self) -> None:
         shortcut_ready = self._shortcut_is_trusted() and self.shortcut_monitor.is_running
+        queued_count, active_job = self._queue_state()
         self.start_button.set_callback(self.start_recording)
         self.stop_button.set_callback(self.stop_recording)
         self.start_button.state = 0
         self.stop_button.state = 1 if self.recorder.is_recording else 0
 
-        if self._transcribing:
-            self.start_button.title = "Transcribing in Background..."
-        elif self.recorder.is_recording:
+        if self.recorder.is_recording:
             self.start_button.title = "Recording in Progress..."
         else:
             self.start_button.title = "Start Recording"
@@ -1028,6 +1209,13 @@ class VoiceDropApp(rumps.App):
         self.stop_button.title = (
             "Stop Recording" if self.recorder.is_recording else "Stop Recording (inactive)"
         )
+        if active_job is None and queued_count == 0:
+            self.queue_status_button.title = "Queue: idle"
+        elif active_job is None:
+            self.queue_status_button.title = f"Queue: {queued_count} pending"
+        else:
+            active_label = "live" if active_job.kind == "live" else "import"
+            self.queue_status_button.title = f"Queue: {active_label} + {queued_count} pending"
         self.copy_last_button.title = (
             "Copy Last Transcript"
             if LAST_TRANSCRIPT_FILE.exists()
@@ -1081,10 +1269,243 @@ class VoiceDropApp(rumps.App):
             f"{len(sessions)} unfinished recording folder(s) are in Audio/InProgress.",
         )
 
-    def _start_recording_impl(self, source: str) -> None:
-        if self._transcribing:
-            send_notification("Busy", "VoiceDrop is still transcribing the last recording.")
+    def _recover_pending_imports(self) -> None:
+        try:
+            pending_files = sorted(
+                path
+                for path in IMPORT_PROCESSING_DIR.iterdir()
+                if path.is_file() and path.suffix.lower() in SUPPORTED_IMPORT_EXTENSIONS
+            )
+        except Exception:
+            LOGGER.exception("Failed to scan pending import files")
             return
+
+        for path in pending_files:
+            self._enqueue_import_job(path, self._extract_stamp_from_name(path.name))
+
+        if pending_files:
+            send_notification(
+                "Recovered import jobs",
+                f"{len(pending_files)} audio file(s) were re-queued from Import/Processing.",
+            )
+
+    def _extract_stamp_from_name(self, name: str) -> str:
+        match = re.match(r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})", name)
+        if match:
+            return match.group(1)
+        return utc_timestamp()
+
+    def _enqueue_job(self, job: TranscriptionJob) -> None:
+        with self._job_state_lock:
+            self._queued_job_count += 1
+        self._job_queue.put(job)
+        AppHelper.callAfter(self._refresh_menu_state)
+
+    def _enqueue_live_job(self, audio_path: Path, archive_path: Path, stamp: str) -> None:
+        job = TranscriptionJob(
+            priority=0,
+            sequence=next(self._job_counter),
+            kind="live",
+            audio_path=audio_path,
+            stamp=stamp,
+            archive_path=archive_path,
+        )
+        self._enqueue_job(job)
+
+    def _enqueue_import_job(self, audio_path: Path, stamp: str) -> None:
+        key = str(audio_path)
+        with self._job_state_lock:
+            if key in self._queued_import_paths:
+                return
+            self._queued_import_paths.add(key)
+        job = TranscriptionJob(
+            priority=10,
+            sequence=next(self._job_counter),
+            kind="import",
+            audio_path=audio_path,
+            stamp=stamp,
+            source_path=audio_path,
+        )
+        self._enqueue_job(job)
+
+    def _transcription_worker_loop(self) -> None:
+        while True:
+            job = self._job_queue.get()
+            with self._job_state_lock:
+                self._queued_job_count = max(0, self._queued_job_count - 1)
+                self._active_job = job
+            AppHelper.callAfter(self._refresh_menu_state)
+            try:
+                if job.kind == "live":
+                    self._process_live_job(job)
+                else:
+                    self._process_import_job(job)
+            except Exception:
+                LOGGER.exception("Unexpected queued job failure: %s", job.kind)
+            finally:
+                with self._job_state_lock:
+                    if job.kind == "import":
+                        self._queued_import_paths.discard(str(job.audio_path))
+                    self._active_job = None
+                if not self.recorder.is_recording:
+                    AppHelper.callAfter(self._set_title, "VD")
+                AppHelper.callAfter(self._refresh_menu_state)
+
+    def _import_watch_loop(self) -> None:
+        while True:
+            try:
+                self._scan_import_inbox()
+            except Exception:
+                LOGGER.exception("Import inbox scan failed")
+            time.sleep(IMPORT_SCAN_INTERVAL_SECONDS)
+
+    def _scan_import_inbox(self) -> None:
+        ensure_dirs()
+        observations: dict[str, tuple[int, int]] = {}
+        now = time.time()
+
+        for path in sorted(IMPORT_INBOX_DIR.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMPORT_EXTENSIONS:
+                continue
+
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+
+            key = str(path)
+            signature = (int(stat.st_size), int(stat.st_mtime))
+            previous = self._import_observations.get(key)
+            observations[key] = signature
+
+            if now - stat.st_mtime < IMPORT_STABILITY_SECONDS or previous != signature:
+                continue
+
+            stamp, processing_path = reserve_import_processing_path(path)
+            try:
+                path.rename(processing_path)
+            except OSError:
+                try:
+                    shutil.move(str(path), str(processing_path))
+                except Exception:
+                    LOGGER.exception("Failed to move import file into processing: %s", path)
+                    continue
+
+            LOGGER.info("Queued imported audio: %s", processing_path)
+            self._enqueue_import_job(processing_path, stamp)
+            observations.pop(key, None)
+
+        self._import_observations = observations
+
+    def _rename_live_archive(self, archive_path: Path, stamp: str, label: str) -> Path:
+        if not archive_path.exists():
+            return archive_path
+        target = make_unique_path(
+            archive_path.with_name(
+                f"VoiceDrop_{stamp}_{sanitize_filename_component(label, fallback='speech', max_length=32)}{archive_path.suffix}"
+            )
+        )
+        archive_path.replace(target)
+        return target
+
+    def _process_live_job(self, job: TranscriptionJob) -> None:
+        audio_path = job.audio_path
+        archive_path = job.archive_path or audio_path
+        try:
+            text, language, backend = self.transcriber.transcribe(audio_path)
+            if not text:
+                raise NoSpeechDetectedError("No speech was detected in the recording.")
+
+            label = build_transcript_label(text, fallback="speech")
+            final_archive_path = self._rename_live_archive(archive_path, job.stamp, label)
+            transcript_path = save_transcript(text, stamp=job.stamp, label=label)
+            copy_to_clipboard(text)
+            pasted = False
+            paste_error = None
+            try:
+                time.sleep(0.12)
+                paste_into_focused_app()
+                pasted = True
+                LOGGER.info("Transcript pasted into focused app")
+            except Exception as exc:
+                paste_error = exc
+                LOGGER.exception("Automatic paste failed")
+
+            if pasted:
+                send_notification(
+                    "Transcript saved and pasted",
+                    f"{transcript_path.name} ({language}, {backend}) | audio: {final_archive_path.name}",
+                )
+            else:
+                send_notification(
+                    "Transcript saved",
+                    f"{transcript_path.name} ({language}, {backend}) | audio: {final_archive_path.name} | paste failed: {paste_error}",
+                )
+        except NoSpeechDetectedError as exc:
+            LOGGER.info("Recording discarded after transcription: %s", exc)
+            send_notification("Discarded", str(exc))
+        except Exception as exc:
+            LOGGER.exception("Transcription failed")
+            send_notification("Transcription failed", str(exc))
+        finally:
+            try:
+                if audio_path.exists():
+                    audio_path.unlink()
+            except Exception:
+                LOGGER.exception("Failed to remove temp audio: %s", audio_path)
+
+    def _process_import_job(self, job: TranscriptionJob) -> None:
+        source_path = job.audio_path
+        fallback_label = sanitize_filename_component(
+            source_path.stem,
+            fallback="import",
+            max_length=32,
+        )
+        output_dir: Path | None = None
+        try:
+            text, language, backend = self.transcriber.transcribe(source_path)
+            if not text:
+                raise NoSpeechDetectedError("No speech was detected in the imported file.")
+
+            label = build_transcript_label(text, fallback=fallback_label)
+            output_dir = make_unique_dir(IMPORT_PROCESSED_DIR / f"{job.stamp}_{label}")
+            transcript_path = save_transcript(
+                text,
+                stamp=job.stamp,
+                label=label,
+                directory=output_dir,
+            )
+            archived_audio_path, mp3_ready = finalize_import_audio(source_path, output_dir)
+            save_metadata(
+                output_dir / "meta.json",
+                {
+                    "stamp": job.stamp,
+                    "language": language,
+                    "backend": backend,
+                    "source_name": source_path.name,
+                    "transcript_name": transcript_path.name,
+                    "archived_audio": archived_audio_path.name,
+                    "mp3_ready": mp3_ready,
+                },
+            )
+            send_notification(
+                "Imported transcript saved",
+                f"{output_dir.name} ({language}, {backend})",
+            )
+        except NoSpeechDetectedError as exc:
+            failed_dir = move_failed_import(source_path, job.stamp, str(exc))
+            LOGGER.info("Imported audio discarded: %s", failed_dir)
+            send_notification("Imported file discarded", failed_dir.name)
+        except Exception as exc:
+            if output_dir is not None and output_dir.exists() and not source_path.exists():
+                (output_dir / "error.txt").write_text(str(exc) + "\n", encoding="utf-8")
+                failed_dir = output_dir
+            else:
+                failed_dir = move_failed_import(source_path, job.stamp, str(exc))
+            LOGGER.exception("Imported transcription failed")
+            send_notification("Import failed", failed_dir.name)
+
+    def _start_recording_impl(self, source: str) -> None:
         if self.recorder.is_recording:
             send_notification("Already recording", "VoiceDrop is already recording.")
             return
@@ -1139,78 +1560,38 @@ class VoiceDropApp(rumps.App):
             send_notification("Save failed", str(exc))
             return
 
-        LOGGER.info("Recording stopped via %s; starting transcription", source)
-        self._transcribing = True
-        self._set_title("TX")
+        LOGGER.info("Recording stopped via %s; queueing transcription", source)
+        self._enqueue_live_job(audio_path, archive_path, result.started_stamp)
         self._refresh_menu_state()
-
-        self._transcription_thread = threading.Thread(
-            target=self._transcribe_in_background,
-            args=(audio_path, archive_path),
-            daemon=True,
-            name="transcription",
-        )
-        self._transcription_thread.start()
 
     def stop_recording(self, _) -> None:
         self._stop_recording_impl(source="menu")
 
     def toggle_recording_from_shortcut(self) -> None:
-        if self._transcribing:
-            send_notification("Busy", "VoiceDrop is still transcribing the last recording.")
-            return
         if self.recorder.is_recording:
             self._stop_recording_impl(source="shortcut")
         else:
             self._start_recording_impl(source="shortcut")
 
-    def _transcribe_in_background(self, audio_path: Path, archive_path: Path) -> None:
-        try:
-            text, language, backend = self.transcriber.transcribe(audio_path)
-            if not text:
-                raise NoSpeechDetectedError("No speech was detected in the recording.")
-
-            transcript_path = save_transcript(text)
-            copy_to_clipboard(text)
-            pasted = False
-            paste_error = None
-            try:
-                time.sleep(0.12)
-                paste_into_focused_app()
-                pasted = True
-                LOGGER.info("Transcript pasted into focused app")
-            except Exception as exc:
-                paste_error = exc
-                LOGGER.exception("Automatic paste failed")
-
-            if pasted:
-                send_notification(
-                    "Transcript saved and pasted",
-                    f"{transcript_path.name} ({language}, {backend}) | audio: {archive_path.name}",
-                )
-            else:
-                send_notification(
-                    "Transcript saved",
-                    f"{transcript_path.name} ({language}, {backend}) | audio: {archive_path.name} | paste failed: {paste_error}",
-                )
-        except NoSpeechDetectedError as exc:
-            LOGGER.info("Recording discarded after transcription: %s", exc)
-            send_notification("Discarded", str(exc))
-        except Exception as exc:
-            LOGGER.exception("Transcription failed")
-            send_notification("Transcription failed", str(exc))
-        finally:
-            self._transcribing = False
-            self._set_title("VD")
-            self._refresh_menu_state()
-            try:
-                if audio_path.exists():
-                    audio_path.unlink()
-            except Exception:
-                LOGGER.exception("Failed to remove temp audio: %s", audio_path)
-
     def open_transcripts(self, _) -> None:
         open_in_finder(TRANSCRIPTS_DIR)
+
+    def open_import_inbox(self, _) -> None:
+        open_in_finder(IMPORT_INBOX_DIR)
+
+    def open_import_processed(self, _) -> None:
+        open_in_finder(IMPORT_PROCESSED_DIR)
+
+    def open_import_failed(self, _) -> None:
+        open_in_finder(IMPORT_FAILED_DIR)
+
+    def scan_import_inbox_now(self, _) -> None:
+        try:
+            self._scan_import_inbox()
+            send_notification("Import scan complete", "Import/Inbox was scanned.")
+        except Exception as exc:
+            LOGGER.exception("Manual import scan failed")
+            send_notification("Import scan failed", str(exc))
 
     def open_logs(self, _) -> None:
         open_in_finder(LOG_DIR)
