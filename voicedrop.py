@@ -175,6 +175,10 @@ pending_paste_armed = False
 pending_paste_expires_at = 0.0
 synthetic_click_in_progress = False
 hotkey_reset_timer = None
+transcription_state_lock = threading.Lock()
+transcription_seq = 0
+active_transcription_ids = set()
+discard_results_through_id = 0
 
 
 # ══════════════════════════════════════════════════
@@ -848,14 +852,42 @@ def start_recording():
         if app:
             app.show_error("録音を開始できませんでした")
 
+
+def _begin_transcription():
+    global transcription_seq, is_transcribing
+    with transcription_state_lock:
+        transcription_seq += 1
+        tid = transcription_seq
+        active_transcription_ids.add(tid)
+        is_transcribing = True
+        return tid
+
+
+def _finish_transcription(tid):
+    global is_transcribing
+    with transcription_state_lock:
+        active_transcription_ids.discard(tid)
+        is_transcribing = bool(active_transcription_ids)
+
+
+def _discard_current_output():
+    global discard_results_through_id
+    _clear_pending_paste()
+    with transcription_state_lock:
+        discard_results_through_id = transcription_seq
+
+
+def _should_drop_transcription_result(tid):
+    with transcription_state_lock:
+        return tid <= discard_results_through_id
+
 def stop_and_transcribe(auto_stopped=False):
-    global is_recording, is_transcribing, stream, audio_level
+    global is_recording, stream, audio_level
     with stop_lock:
         if not is_recording and stream is None:
             return
 
         is_recording = False
-        is_transcribing = True
         audio_level  = 0.0
         _cancel_recording_timer()
         _save_mouse_pos()
@@ -869,20 +901,22 @@ def stop_and_transcribe(auto_stopped=False):
         audio = np.array(audio_buffer, dtype=np.float32)
 
     if len(audio) < SAMPLE_RATE * 0.3:
-        is_transcribing = False
         if app:
             app.show_idle()
         return
+
+    transcription_id = _begin_transcription()
 
     if app:
         app.show_transcribing()
 
     def _run():
-        global is_transcribing
         try:
             text = _transcribe_audio_chunks(audio)
+            if _should_drop_transcription_result(transcription_id):
+                return
             if not text:
-                if app:
+                if app and not is_recording:
                     app.show_idle()
                 return
 
@@ -893,8 +927,10 @@ def stop_and_transcribe(auto_stopped=False):
             should_save_to_file = len(audio) >= SAMPLE_RATE * FILE_SAVE_MINUTES_THRESHOLD
 
             if should_save_to_file:
+                if _should_drop_transcription_result(transcription_id):
+                    return
                 path = _save_transcript_to_file(text)
-                if app:
+                if app and not is_recording:
                     app.show_done()
                 notify(
                     "VoiceDrop",
@@ -903,10 +939,12 @@ def stop_and_transcribe(auto_stopped=False):
                 )
                 return
 
+            if _should_drop_transcription_result(transcription_id):
+                return
             _arm_click_to_paste(text)
-            if app:
+            if app and not is_recording:
                 app.show_idle()
-            if auto_stopped:
+            if auto_stopped and not _should_drop_transcription_result(transcription_id):
                 notify(
                     "VoiceDrop",
                     "自動停止しました",
@@ -914,10 +952,10 @@ def stop_and_transcribe(auto_stopped=False):
                 )
         except Exception:
             log_exception("transcription flow failed")
-            if app:
+            if app and not _should_drop_transcription_result(transcription_id):
                 app.show_error("文字起こしまたは出力に失敗しました")
         finally:
-            is_transcribing = False
+            _finish_transcription(transcription_id)
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -928,18 +966,12 @@ def stop_and_transcribe(auto_stopped=False):
 def _trigger():
     if not model_ready.is_set():
         return
-    if is_transcribing:
-        notify(
-            "VoiceDrop",
-            "文字起こし中です",
-            "完了してから次の録音を開始してください",
-        )
-        return
-    if not is_recording:
-        threading.Thread(target=start_recording,     daemon=True).start()
-    else:
+    if is_recording:
         threading.Thread(target=stop_and_transcribe, daemon=True).start()
-
+        return
+    if is_transcribing or pending_paste_armed:
+        _discard_current_output()
+    threading.Thread(target=start_recording, daemon=True).start()
 def _alt_held():
     return any(k in current_keys for k in
                (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r))
