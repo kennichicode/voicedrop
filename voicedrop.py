@@ -80,6 +80,9 @@ RECORDING_SEGMENT_SECONDS = 1.0
 AUDIO_ARCHIVE_BITRATE = os.getenv("VOICEDROP_AUDIO_BITRATE", "192k")
 IMPORT_SCAN_INTERVAL_SECONDS = 3.0
 IMPORT_STABILITY_SECONDS = 2.0
+STOP_OPERATION_TIMEOUT_SECONDS = float(
+    os.getenv("VOICEDROP_STOP_TIMEOUT_SECONDS", "20.0")
+)
 SILENCE_RMS_THRESHOLD = 0.0035
 SILENCE_PEAK_THRESHOLD = 0.02
 SILENCE_ACTIVE_RATIO_THRESHOLD = 0.008
@@ -1090,6 +1093,8 @@ class VoiceDropApp(rumps.App):
         self._active_job: TranscriptionJob | None = None
         self._queued_import_paths: set[str] = set()
         self._import_observations: dict[str, tuple[int, int]] = {}
+        self._recording_transition_lock = threading.Lock()
+        self._recording_transition: str | None = None
         self.shortcut_monitor = RightOptionEventTap(self.toggle_recording_from_shortcut)
         self._spinner_thread = threading.Thread(
             target=self._spinner_loop,
@@ -1171,6 +1176,21 @@ class VoiceDropApp(rumps.App):
         with self._job_state_lock:
             return self._queued_job_count, self._active_job
 
+    def _recording_transition_state(self) -> str | None:
+        with self._recording_transition_lock:
+            return self._recording_transition
+
+    def _begin_recording_transition(self, transition: str) -> bool:
+        with self._recording_transition_lock:
+            if self._recording_transition is not None:
+                return False
+            self._recording_transition = transition
+            return True
+
+    def _clear_recording_transition(self) -> None:
+        with self._recording_transition_lock:
+            self._recording_transition = None
+
     def _has_pending_work(self) -> bool:
         queued_count, active_job = self._queue_state()
         return queued_count > 0 or active_job is not None
@@ -1178,6 +1198,10 @@ class VoiceDropApp(rumps.App):
     def _spinner_loop(self) -> None:
         index = 0
         while True:
+            if self._recording_transition_state() is not None:
+                index = 0
+                time.sleep(0.1)
+                continue
             if self.recorder.is_recording:
                 index = 0
                 time.sleep(0.1)
@@ -1196,19 +1220,29 @@ class VoiceDropApp(rumps.App):
     def _refresh_menu_state(self) -> None:
         shortcut_ready = self._shortcut_is_trusted() and self.shortcut_monitor.is_running
         queued_count, active_job = self._queue_state()
+        transition = self._recording_transition_state()
         self.start_button.set_callback(self.start_recording)
         self.stop_button.set_callback(self.stop_recording)
         self.start_button.state = 0
-        self.stop_button.state = 1 if self.recorder.is_recording else 0
+        self.stop_button.state = 1 if self.recorder.is_recording or transition == "stopping" else 0
 
-        if self.recorder.is_recording:
+        if transition == "starting":
+            self.start_button.title = "Starting..."
+        elif transition == "stopping":
+            self.start_button.title = "Start Recording (busy)"
+        elif self.recorder.is_recording:
             self.start_button.title = "Recording in Progress..."
         else:
             self.start_button.title = "Start Recording"
 
-        self.stop_button.title = (
-            "Stop Recording" if self.recorder.is_recording else "Stop Recording (inactive)"
-        )
+        if transition == "stopping":
+            self.stop_button.title = "Stopping..."
+        elif transition == "starting":
+            self.stop_button.title = "Stop Recording (inactive)"
+        else:
+            self.stop_button.title = (
+                "Stop Recording" if self.recorder.is_recording else "Stop Recording (inactive)"
+            )
         if active_job is None and queued_count == 0:
             self.queue_status_button.title = "Queue: idle"
         elif active_job is None:
@@ -1505,73 +1539,173 @@ class VoiceDropApp(rumps.App):
             LOGGER.exception("Imported transcription failed")
             send_notification("Import failed", failed_dir.name)
 
-    def _start_recording_impl(self, source: str) -> None:
+    def _start_stop_watchdog(self, completed: threading.Event) -> None:
+        def watch() -> None:
+            if completed.wait(STOP_OPERATION_TIMEOUT_SECONDS):
+                return
+            LOGGER.error(
+                "Recording stop exceeded %.1f seconds; forcing restart",
+                STOP_OPERATION_TIMEOUT_SECONDS,
+            )
+            try:
+                send_notification(
+                    "VoiceDrop restarting",
+                    "Recording stop got stuck. VoiceDrop will relaunch automatically.",
+                )
+            except Exception:
+                LOGGER.exception("Failed to send watchdog notification")
+            os._exit(75)
+
+        threading.Thread(
+            target=watch,
+            name="stop-watchdog",
+            daemon=True,
+        ).start()
+
+    def _finish_start_recording(self) -> None:
+        self._clear_recording_transition()
+        self._set_title("REC")
+        self._refresh_menu_state()
+        send_notification("Recording", "VoiceDrop is recording from the microphone.")
+
+    def _fail_start_recording(self, message: str) -> None:
+        self._clear_recording_transition()
+        self._set_title("VD")
+        self._refresh_menu_state()
+        send_notification("Recording failed", message)
+
+    def _finish_stop_recording(self) -> None:
+        self._clear_recording_transition()
+        self._refresh_menu_state()
+
+    def _discard_stop_recording(self, message: str) -> None:
+        self._clear_recording_transition()
+        self._set_title("VD")
+        self._refresh_menu_state()
+        send_notification("Discarded", message)
+
+    def _fail_stop_recording(self, title: str, message: str) -> None:
+        self._clear_recording_transition()
+        self._set_title("VD")
+        self._refresh_menu_state()
+        send_notification(title, message)
+
+    def _start_recording_worker(self, source: str) -> None:
         if self.recorder.is_recording:
-            send_notification("Already recording", "VoiceDrop is already recording.")
+            LOGGER.info("Ignoring start request via %s because recording is already active", source)
+            AppHelper.callAfter(
+                self._fail_start_recording,
+                "VoiceDrop is already recording.",
+            )
             return
 
         try:
             self.recorder.start()
         except Exception as exc:
             LOGGER.exception("Failed to start recording")
-            send_notification("Recording failed", str(exc))
+            AppHelper.callAfter(self._fail_start_recording, str(exc))
             return
 
         LOGGER.info("Recording started via %s", source)
-        self._set_title("REC")
-        self._refresh_menu_state()
-        send_notification("Recording", "VoiceDrop is recording from the microphone.")
+        AppHelper.callAfter(self._finish_start_recording)
 
-    def start_recording(self, _) -> None:
-        self._start_recording_impl(source="menu")
-
-    def _stop_recording_impl(self, source: str) -> None:
+    def _stop_recording_worker(self, source: str) -> None:
+        completed = threading.Event()
+        self._start_stop_watchdog(completed)
         if not self.recorder.is_recording:
-            send_notification("Not recording", "There is no active recording to stop.")
+            LOGGER.info("Ignoring stop request via %s because recording is not active", source)
+            completed.set()
+            AppHelper.callAfter(
+                self._fail_stop_recording,
+                "Not recording",
+                "There is no active recording to stop.",
+            )
             return
+
         try:
             result = self.recorder.stop()
         except Exception as exc:
             LOGGER.exception("Failed to stop recording")
-            send_notification("Stop failed", str(exc))
+            completed.set()
+            AppHelper.callAfter(self._fail_stop_recording, "Stop failed", str(exc))
             return
-
-        self._refresh_menu_state()
 
         if result.duration_seconds < MIN_RECORDING_SECONDS or not result.segment_paths:
             LOGGER.info("Short recording discarded via %s", source)
             cleanup_recording_session(result)
-            self._set_title("VD")
-            send_notification("Discarded", "Recording was too short.")
+            completed.set()
+            AppHelper.callAfter(self._discard_stop_recording, "Recording was too short.")
             return
 
         if is_effectively_silent_metrics(result.peak, result.rms, result.active_ratio):
             LOGGER.info("Silent recording discarded via %s", source)
             cleanup_recording_session(result)
-            self._set_title("VD")
-            send_notification("Discarded", "No speech was detected.")
+            completed.set()
+            AppHelper.callAfter(self._discard_stop_recording, "No speech was detected.")
             return
 
         try:
             audio_path, archive_path = save_recording(result)
         except Exception as exc:
             LOGGER.exception("Failed to save recording")
-            self._set_title("VD")
-            send_notification("Save failed", str(exc))
+            completed.set()
+            AppHelper.callAfter(self._fail_stop_recording, "Save failed", str(exc))
             return
 
         LOGGER.info("Recording stopped via %s; queueing transcription", source)
         self._enqueue_live_job(audio_path, archive_path, result.started_stamp)
+        completed.set()
+        AppHelper.callAfter(self._finish_stop_recording)
+
+    def _request_start_recording(self, source: str) -> None:
+        if self.recorder.is_recording:
+            send_notification("Already recording", "VoiceDrop is already recording.")
+            return
+        if not self._begin_recording_transition("starting"):
+            LOGGER.info("Ignoring start request via %s during transition", source)
+            return
+        self._set_title("...")
         self._refresh_menu_state()
+        threading.Thread(
+            target=self._start_recording_worker,
+            args=(source,),
+            name="recording-start",
+            daemon=True,
+        ).start()
+
+    def start_recording(self, _) -> None:
+        self._request_start_recording(source="menu")
+
+    def _request_stop_recording(self, source: str) -> None:
+        if not self.recorder.is_recording:
+            if self._recording_transition_state() == "stopping":
+                LOGGER.info("Ignoring extra stop request via %s while stopping", source)
+                return
+            send_notification("Not recording", "There is no active recording to stop.")
+            return
+        if not self._begin_recording_transition("stopping"):
+            LOGGER.info("Ignoring stop request via %s during transition", source)
+            return
+        self._set_title("STP")
+        self._refresh_menu_state()
+        threading.Thread(
+            target=self._stop_recording_worker,
+            args=(source,),
+            name="recording-stop",
+            daemon=True,
+        ).start()
 
     def stop_recording(self, _) -> None:
-        self._stop_recording_impl(source="menu")
+        self._request_stop_recording(source="menu")
 
     def toggle_recording_from_shortcut(self) -> None:
+        if self._recording_transition_state() is not None:
+            LOGGER.info("Ignoring shortcut press during recording transition")
+            return
         if self.recorder.is_recording:
-            self._stop_recording_impl(source="shortcut")
+            self._request_stop_recording(source="shortcut")
         else:
-            self._start_recording_impl(source="shortcut")
+            self._request_start_recording(source="shortcut")
 
     def open_transcripts(self, _) -> None:
         open_in_finder(TRANSCRIPTS_DIR)
