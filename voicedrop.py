@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """VoiceDrop — Click-to-paste voice input for macOS"""
 
-import threading, subprocess, time, json, traceback, sys, multiprocessing, os, tempfile, re as _re
-import ctypes, ctypes.util
-import Quartz as _Q
+import threading, subprocess, time, json, traceback, sys, multiprocessing, os, tempfile
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -156,14 +154,6 @@ current_keys   = set()
 recording_timer = None
 recording_started_at = 0.0
 stop_lock = threading.Lock()
-is_paused      = False
-_press_start_time: float = 0.0
-_press_was_start: bool = False   # このプレスで録音を開始した → リリース時に無視
-_last_pause_press: float = 0.0   # 一時停止プレスの時刻（ダブルプレス検出用）
-_DOUBLE_PRESS_SEC = 0.4          # ダブルプレス判定時間（秒）
-_RIGHT_OPTION_VK   = 61          # Right Option の仮想キーコード
-_active_event_tap  = None        # CGEventTap 参照保持
-_tap_cb_ref        = None        # ctypes callback GC防止
 saved_mouse_x  = 0.0   # Quartz coords for click
 saved_mouse_y  = 0.0
 saved_appkit_x = 0.0   # AppKit coords for overlay
@@ -198,34 +188,23 @@ class _MicBgView(NSView):
             0.06, 0.06, 0.06, 0.90).setFill()
         path.fill()
 
+        # red recording dot
         dot_d = 8
         dot_x = 14
         dot_y = (h - dot_d) / 2
         dot_path = NSBezierPath.bezierPathWithOvalInRect_(
             ((dot_x, dot_y), (dot_d, dot_d)))
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            0.95, 0.22, 0.22, 1.0).setFill()
+        dot_path.fill()
 
-        if is_paused:
-            # 黄色ドット + ⏸
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                1.0, 0.78, 0.0, 1.0).setFill()
-            dot_path.fill()
-            label = "⏸"
-            label_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                1.0, 0.85, 0.2, 1.0)
-        else:
-            # 赤ドット + REC
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                0.95, 0.22, 0.22, 1.0).setFill()
-            dot_path.fill()
-            label = "REC"
-            label_color = NSColor.whiteColor()
-
+        # REC label
         try:
             attrs = {
                 NSFontAttributeName: NSFont.boldSystemFontOfSize_(12),
-                NSForegroundColorAttributeName: label_color,
+                NSForegroundColorAttributeName: NSColor.whiteColor(),
             }
-            s = NSAttributedString.alloc().initWithString_attributes_(label, attrs)
+            s = NSAttributedString.alloc().initWithString_attributes_("REC", attrs)
             sz = s.size()
             x = dot_x + dot_d + 7
             y = (h - sz.height) / 2
@@ -284,17 +263,6 @@ class MicOverlay(NSObject):
         if self._panel:
             self._panel.orderOut_(None)
 
-    @objc.python_method
-    def refresh(self):
-        """一時停止/再開後に再描画"""
-        self.performSelectorOnMainThread_withObject_waitUntilDone_(
-            b'_refresh:', None, False)
-
-    def _refresh_(self, _):
-        if self._panel:
-            self._panel.contentView().setNeedsDisplay_(True)
-            self._panel.display()
-
 
 overlay_ctrl: MicOverlay = None   # initialized in __main__
 
@@ -302,33 +270,6 @@ overlay_ctrl: MicOverlay = None   # initialized in __main__
 # ══════════════════════════════════════════════════
 #  Menu Bar App  (clean, minimal UI)
 # ══════════════════════════════════════════════════
-# ── Status item single-click handler ──────────────────────────────────────────
-class _StatusClickHandler(NSObject):
-    """録音中: クリック = 一時停止/再開。非録音中: メニューを表示。"""
-
-    def init(self):
-        self = objc.super(_StatusClickHandler, self).init()
-        self._si = None
-        return self
-
-    @objc.python_method
-    def attach(self, status_item):
-        self._si = status_item
-        btn = status_item.button()
-        btn.setTarget_(self)
-        btn.setAction_(b'_clicked:')
-
-    def _clicked_(self, sender):
-        if is_recording:
-            toggle_pause()
-        else:
-            if self._si:
-                self._si.popUpStatusItemMenu_(self._si.menu())
-
-
-_status_click_handler: "_StatusClickHandler | None" = None
-
-
 class VoiceDropApp(rumps.App):
 
     _REC_FRAMES   = ["● REC", "  REC"]
@@ -341,7 +282,6 @@ class VoiceDropApp(rumps.App):
 
         self._start_item = rumps.MenuItem("Start Recording", callback=self._start_recording)
         self._stop_item = rumps.MenuItem("Stop & Transcribe", callback=self._stop_recording)
-        self._pause_item = rumps.MenuItem("⏸  一時停止", callback=self._toggle_pause)
         self._hotkey_status_item = rumps.MenuItem("Hotkey: starting...", callback=None)
 
         self._hotkey_items = {}
@@ -357,7 +297,6 @@ class VoiceDropApp(rumps.App):
         self.menu = [
             self._start_item,
             self._stop_item,
-            self._pause_item,
             None,
             self._history_sub,
             None,
@@ -370,8 +309,6 @@ class VoiceDropApp(rumps.App):
         self._refresh_recording_menu()
         self._refresh_history_menu()
         self._set_waveform_icon()
-        # 起動後に単クリックハンドラを設定（NSStatusItemが準備できてから）
-        AppHelper.callLater(0.3, self._setup_click_handler)
 
     def _set_waveform_icon(self):
         if _WAVEFORM_PNG_PATH is None:
@@ -452,35 +389,6 @@ class VoiceDropApp(rumps.App):
     def _set_hotkey_status(self, text):
         self._hotkey_status_item.title = text
 
-    @property
-    def _status_item(self):
-        return self._nsapp.nsstatusitem
-
-    def _setup_click_handler(self):
-        global _status_click_handler
-        try:
-            _status_click_handler = _StatusClickHandler.alloc().init()
-            _status_click_handler.attach(self._status_item)
-        except Exception:
-            log_exception("_setup_click_handler failed")
-
-    def _detach_menu(self):
-        """録音中: メニューを外してボタンのactionを有効化"""
-        try:
-            self._status_item.setMenu_(None)
-        except Exception:
-            pass
-
-    def _reattach_menu(self):
-        """非録音中: メニューを再アタッチ"""
-        try:
-            self._status_item.setMenu_(self.menu._menu)
-        except Exception:
-            pass
-
-    def _toggle_pause(self, _):
-        toggle_pause()
-
     def _refresh_recording_menu(self):
         self._start_item.set_callback(self._start_recording)
         self._stop_item.set_callback(self._stop_recording)
@@ -490,24 +398,11 @@ class VoiceDropApp(rumps.App):
         self._stop_item.state = 0
         if is_recording:
             self._start_item.title = "Start Recording (busy)"
-            self._pause_item.title = "▶  再開" if is_paused else "⏸  一時停止"
-            self._pause_item.set_callback(self._toggle_pause)
         else:
             self._stop_item.title = "Stop & Transcribe (idle)"
-            self._pause_item.title = "⏸  一時停止 (録音中のみ)"
-            self._pause_item.set_callback(None)
 
     def show_recording(self):
         AppHelper.callAfter(self._show_recording)
-
-    def show_paused(self):
-        AppHelper.callAfter(self._show_paused)
-
-    def _show_paused(self):
-        self._anim_on = False
-        self._set_title("⏸")
-        self._refresh_recording_menu()
-        self._detach_menu()
 
     def show_transcribing(self):
         AppHelper.callAfter(self._show_transcribing)
@@ -525,34 +420,29 @@ class VoiceDropApp(rumps.App):
         self._anim_on  = True
         self._anim_idx = 0
         self._refresh_recording_menu()
-        self._detach_menu()
         self._animate_rec()
 
     def _show_transcribing(self):
         self._anim_on = False
         self._anim_idx = 0
         self._refresh_recording_menu()
-        self._reattach_menu()
         self._animate_spin()
 
     def _show_done(self):
         self._anim_on = False
         self._set_title("✓")
         self._refresh_recording_menu()
-        self._reattach_menu()
         AppHelper.callLater(2.0, self._show_idle)
 
     def _show_idle(self):
         self._anim_on = False
         self._set_waveform_icon()
         self._refresh_recording_menu()
-        self._reattach_menu()
 
     def _show_error(self, msg=""):
         self._anim_on = False
         self._set_waveform_icon()
         self._refresh_recording_menu()
-        self._reattach_menu()
         if msg:
             rumps.notification("VoiceDrop", "Error", msg, False)
 
@@ -634,34 +524,11 @@ def _record_click_target(x, y):
         log_exception("failed to record click target")
 
 
-def _click_on_overlay(x, y) -> bool:
-    """クリック座標がRECオーバーレイの上なら True を返す（Quartz座標）"""
-    if not is_recording or not overlay_ctrl or not overlay_ctrl._panel:
-        return False
-    try:
-        import Quartz as Q
-        h_screen = Q.CGDisplayBounds(Q.CGMainDisplayID()).size.height
-        ox1 = overlay_ctrl._px
-        ox2 = overlay_ctrl._px + _OVERLAY_W
-        oy1 = h_screen - (overlay_ctrl._py + _OVERLAY_H)
-        oy2 = h_screen - overlay_ctrl._py
-        hit = ox1 <= x <= ox2 and oy1 <= y <= oy2
-        print(f"[OVERLAY] click=({x:.0f},{y:.0f}) overlay=({ox1:.0f}-{ox2:.0f}, {oy1:.0f}-{oy2:.0f}) hit={hit}", flush=True)
-        return hit
-    except Exception as e:
-        print(f"[OVERLAY] error: {e}", flush=True)
-        return False
-
-
 def on_click(x, y, button, pressed):
     global pending_paste_armed
     if not pressed:
         return
     if synthetic_click_in_progress:
-        return
-    # RECオーバーレイをクリック → 一時停止 / 再開
-    if _click_on_overlay(x, y):
-        toggle_pause()
         return
     if pending_paste_armed and not is_recording:
         _record_click_target(x, y)
@@ -799,33 +666,6 @@ def _auto_stop_recording():
     stop_and_transcribe(auto_stopped=True)
 
 
-def pause_recording():
-    global is_paused
-    if not is_recording or is_paused:
-        return
-    is_paused = True
-    if app:
-        app.show_paused()
-    if overlay_ctrl:
-        overlay_ctrl.refresh()
-
-def resume_recording():
-    global is_paused
-    if not is_recording or not is_paused:
-        return
-    is_paused = False
-    if app:
-        app.show_recording()
-    if overlay_ctrl:
-        overlay_ctrl.refresh()
-
-def toggle_pause():
-    if is_paused:
-        threading.Thread(target=resume_recording, daemon=True).start()
-    else:
-        threading.Thread(target=pause_recording, daemon=True).start()
-
-
 def _transcript_path():
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -853,24 +693,7 @@ _HALLUCINATION_PHRASES = {
 
 def _is_hallucination(text: str) -> bool:
     t = text.strip()
-    if not t:
-        return True
-    # 句読点・空白を除いて比較（「ご視聴ありがとうございました。」も除去）
-    t_norm = _re.sub(r'[。、.,!?！？\s]', '', t)
-    for phrase in _HALLUCINATION_PHRASES:
-        p_norm = _re.sub(r'[。、.,!?！？\s]', '', phrase)
-        if t_norm == p_norm:
-            return True
-    return False
-
-
-def _dedup_repeats(text: str) -> str:
-    """ご視聴… / コ連打 / 指連打などの繰り返しを除去する"""
-    # 同じ文字が3回以上連続 → 1回に (コここここ → コ)
-    text = _re.sub(r'(.)\1{2,}', r'\1', text)
-    # 同じ単語/フレーズが3回以上 → 1回に (指を指を指を → 指を)
-    text = _re.sub(r'(\S{1,10})\1{2,}', r'\1', text)
-    return text.strip()
+    return t in _HALLUCINATION_PHRASES or not t
 
 
 def _transcribe_audio_chunks(audio):
@@ -879,10 +702,8 @@ def _transcribe_audio_chunks(audio):
         path_or_hf_repo=MLX_MODEL_REPO,
         language=LANGUAGE,
         initial_prompt="以下は日本語の音声です。句読点（。、）を適切に含めて文字起こししてください。",
-        condition_on_previous_text=False,  # ループハルシネーション防止
-        temperature=0.0,                   # 貪欲デコード（最速）
     )
-    text = _dedup_repeats(result.get("text", "").strip())
+    text = result.get("text", "").strip()
     if _is_hallucination(text):
         return ""
     return text
@@ -895,18 +716,15 @@ app: VoiceDropApp = None
 
 def audio_callback(indata, frames, time_info, status):
     global audio_level
-    if is_recording and not is_paused:
+    if is_recording:
         audio_buffer.extend(indata[:, 0].tolist())
         audio_level = float(np.sqrt(np.mean(indata ** 2))) * 3.5
-    elif is_paused:
-        audio_level = 0.0
 
 def start_recording():
-    global is_recording, is_paused, audio_buffer, stream, recording_started_at, click_target_ready, pending_paste_armed
+    global is_recording, audio_buffer, stream, recording_started_at, click_target_ready, pending_paste_armed
     try:
         audio_buffer = []
         is_recording = True
-        is_paused    = False  # 前回の状態が残らないよう必ずリセット
         click_target_ready = False
         pending_paste_armed = False
         recording_started_at = time.monotonic()
@@ -927,13 +745,12 @@ def start_recording():
             app.show_error("録音を開始できませんでした")
 
 def stop_and_transcribe(auto_stopped=False):
-    global is_recording, is_transcribing, stream, audio_level, is_paused
+    global is_recording, is_transcribing, stream, audio_level
     with stop_lock:
         if not is_recording and stream is None:
             return
 
         is_recording = False
-        is_paused    = False
         is_transcribing = True
         audio_level  = 0.0
         _cancel_recording_timer()
@@ -1002,111 +819,6 @@ def stop_and_transcribe(auto_stopped=False):
 
 
 # ══════════════════════════════════════════════════
-#  CGEventTap: Right Option を OS レベルで横取り
-#  (Claudeのdouble-tap-option検出より前に処理)
-# ══════════════════════════════════════════════════
-def _on_right_option_down():
-    global hotkey_active, _press_start_time, _press_was_start
-    if hotkey_active:
-        return
-    hotkey_active = True
-    _press_start_time = time.time()
-    if not is_recording and not is_transcribing and model_ready.is_set():
-        _press_was_start = True
-        threading.Thread(target=start_recording, daemon=True).start()
-    else:
-        _press_was_start = False
-
-
-def _on_right_option_up():
-    global hotkey_active, _press_was_start, _last_pause_press
-    hotkey_active = False
-    if _press_was_start:
-        _press_was_start = False
-        return
-    if is_recording:
-        now = time.time()
-        elapsed = now - _last_pause_press
-        if elapsed < _DOUBLE_PRESS_SEC:
-            threading.Thread(target=stop_and_transcribe, daemon=True).start()
-        else:
-            _last_pause_press = now
-            toggle_pause()
-
-
-
-
-def _setup_event_tap():
-    """メインスレッドから呼ぶ（AppHelper.callLater経由）"""
-    global _active_event_tap, _tap_cb_ref
-    try:
-        # ctypesでcallbackを正しくwrap（PyObjCの型変換問題を回避）
-        _TAP_CB = ctypes.CFUNCTYPE(
-            ctypes.c_void_p,   # CGEventRef return (NULL=discard)
-            ctypes.c_void_p,   # CGEventTapProxy
-            ctypes.c_uint32,   # CGEventType
-            ctypes.c_void_p,   # CGEventRef
-            ctypes.c_void_p,   # userInfo
-        )
-
-        # ctypesで直接CoreGraphicsを呼ぶ（PyObjC変換コストを避けてcallbackを高速化）
-        _CG = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
-        _CG.CGEventGetIntegerValueField.restype = ctypes.c_int64
-        _CG.CGEventGetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        _kDown = 10        # kCGEventKeyDown
-        _kUp   = 11        # kCGEventKeyUp
-        _kTO   = 0xFFFFFFFE  # kCGEventTapDisabledByTimeout
-        _kKeycode = 9      # kCGKeyboardEventKeycode
-
-        def _raw_callback(proxy, event_type, event, refcon):
-            try:
-                if event_type == _kTO:
-                    if _active_event_tap:
-                        _Q.CGEventTapEnable(_active_event_tap, True)
-                    return event
-
-                if event_type == _kDown or event_type == _kUp:
-                    vk = _CG.CGEventGetIntegerValueField(event, _kKeycode)
-                    if vk == _RIGHT_OPTION_VK:
-                        if event_type == _kDown:
-                            threading.Thread(target=_on_right_option_down, daemon=True).start()
-                        else:
-                            threading.Thread(target=_on_right_option_up, daemon=True).start()
-                        return None  # イベント破棄
-            except Exception as e:
-                print(f"[TAP] error: {e}", flush=True)
-            return event
-
-        _tap_cb_ref = _TAP_CB(_raw_callback)  # GC防止のためグローバルに保持
-
-        mask = (1 << int(_Q.kCGEventKeyDown)) | (1 << int(_Q.kCGEventKeyUp))
-
-        for tap_level in (_Q.kCGHIDEventTap, _Q.kCGSessionEventTap):
-            tap = _Q.CGEventTapCreate(
-                tap_level,
-                _Q.kCGHeadInsertEventTap,
-                _Q.kCGEventTapOptionDefault,
-                mask,
-                _tap_cb_ref,
-                None,
-            )
-            if tap:
-                src = _Q.CFMachPortCreateRunLoopSource(None, tap, 0)
-                from Foundation import NSRunLoopCommonModes
-                _Q.CFRunLoopAddSource(_Q.CFRunLoopGetMain(), src, NSRunLoopCommonModes)
-                _Q.CGEventTapEnable(tap, True)
-                _active_event_tap = tap
-                print(f"[TAP] CGEventTap level={tap_level} 作成成功", flush=True)
-                break
-            else:
-                print(f"[TAP] level={tap_level} 失敗", flush=True)
-        else:
-            print("[TAP] CGEventTap作成失敗 (アクセシビリティ権限確認してください)", flush=True)
-    except Exception:
-        log_exception("_setup_event_tap failed")
-
-
-# ══════════════════════════════════════════════════
 #  Hotkey listener
 # ══════════════════════════════════════════════════
 def _trigger():
@@ -1124,8 +836,6 @@ def _trigger():
     else:
         threading.Thread(target=stop_and_transcribe, daemon=True).start()
 
-
-
 def _alt_held():
     return any(k in current_keys for k in
                (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r))
@@ -1135,14 +845,16 @@ def _right_alt_pressed(key):
     return key == keyboard.Key.alt_r
 
 def on_press(key):
-    global hotkey_active, _press_start_time, _press_was_start
+    global hotkey_active
     current_keys.add(key)
+    print(f"[KEY] {key!r}  model_ready={model_ready.is_set()}", flush=True)
 
     hk = config.get("hotkey", "right_cmd")
 
     if hk == "right_option":
-        if key == keyboard.Key.alt_r and not hotkey_active:
-            threading.Thread(target=_on_right_option_down, daemon=True).start()
+        if _right_alt_pressed(key) and not hotkey_active:
+            hotkey_active = True
+            _trigger()
     elif hk == "right_cmd":
         if key == keyboard.Key.cmd_r and not hotkey_active:
             hotkey_active = True
@@ -1174,12 +886,12 @@ def on_press(key):
             _trigger()
 
 def on_release(key):
-    global hotkey_active, _press_was_start
+    global hotkey_active
     current_keys.discard(key)
     hk = config.get("hotkey", "right_cmd")
     if hk == "right_option":
-        if key == keyboard.Key.alt_r:
-            threading.Thread(target=_on_right_option_up, daemon=True).start()
+        if _right_alt_pressed(key):
+            hotkey_active = False
     elif hk == "right_cmd":
         if key == keyboard.Key.cmd_r:
             hotkey_active = False
