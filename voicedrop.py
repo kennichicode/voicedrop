@@ -54,6 +54,8 @@ TRANSCRIBE_CHUNK_SECONDS = 60
 FILE_SAVE_MINUTES_THRESHOLD = 3 * 60
 SILENCE_RMS_THRESHOLD = 0.003
 SILENCE_PEAK_THRESHOLD = 0.02
+PASTE_ARM_TIMEOUT_SECONDS = 20
+HOTKEY_STUCK_RESET_SECONDS = 1.2
 
 # ── Hotkey presets ───────────────────────────────
 MIC_VK = 176   # MacBook Air M1 マイクキー (Fn なし) の仮想キーコード
@@ -161,12 +163,18 @@ saved_mouse_y  = 0.0
 saved_appkit_x = 0.0   # AppKit coords for overlay
 saved_appkit_y = 0.0
 saved_frontmost_app_name = ""
+saved_frontmost_app_bundle_id = ""
+saved_frontmost_app_path = ""
 latest_click_x = 0.0
 latest_click_y = 0.0
 latest_click_app_name = ""
+latest_click_app_bundle_id = ""
+latest_click_app_path = ""
 click_target_ready = False
 pending_paste_armed = False
+pending_paste_expires_at = 0.0
 synthetic_click_in_progress = False
+hotkey_reset_timer = None
 
 
 # ══════════════════════════════════════════════════
@@ -497,7 +505,8 @@ def check_accessibility():
 #  Quartz helpers
 # ══════════════════════════════════════════════════
 def _save_mouse_pos():
-    global saved_mouse_x, saved_mouse_y, saved_appkit_x, saved_appkit_y, saved_frontmost_app_name
+    global saved_mouse_x, saved_mouse_y, saved_appkit_x, saved_appkit_y
+    global saved_frontmost_app_name, saved_frontmost_app_bundle_id, saved_frontmost_app_path
     try:
         import Quartz as Q
         p = Q.CGEventGetLocation(Q.CGEventCreate(None))
@@ -506,20 +515,33 @@ def _save_mouse_pos():
         saved_appkit_x, saved_appkit_y = p.x, h - p.y
         app_ref = NSWorkspace.sharedWorkspace().frontmostApplication()
         saved_frontmost_app_name = app_ref.localizedName() if app_ref else ""
+        saved_frontmost_app_bundle_id = app_ref.bundleIdentifier() if app_ref else ""
+        bundle_url = app_ref.bundleURL() if app_ref else None
+        saved_frontmost_app_path = bundle_url.path() if bundle_url else ""
     except Exception:
         log_exception("failed to save mouse position")
 
 
 def _record_click_target(x, y):
     global latest_click_x, latest_click_y, latest_click_app_name, click_target_ready
+    global latest_click_app_bundle_id, latest_click_app_path
     try:
         import Quartz as Q
         latest_click_x, latest_click_y = x, y
         app_ref = NSWorkspace.sharedWorkspace().frontmostApplication()
         latest_click_app_name = app_ref.localizedName() if app_ref else ""
+        latest_click_app_bundle_id = app_ref.bundleIdentifier() if app_ref else ""
+        bundle_url = app_ref.bundleURL() if app_ref else None
+        latest_click_app_path = bundle_url.path() if bundle_url else ""
         click_target_ready = True
     except Exception:
         log_exception("failed to record click target")
+
+
+def _clear_pending_paste():
+    global pending_paste_armed, pending_paste_expires_at
+    pending_paste_armed = False
+    pending_paste_expires_at = 0.0
 
 
 def on_click(x, y, button, pressed):
@@ -528,9 +550,12 @@ def on_click(x, y, button, pressed):
         return
     if synthetic_click_in_progress:
         return
+    if pending_paste_armed and pending_paste_expires_at and time.monotonic() > pending_paste_expires_at:
+        _clear_pending_paste()
+        return
     if pending_paste_armed and not is_recording:
         _record_click_target(x, y)
-        pending_paste_armed = False
+        _clear_pending_paste()
         threading.Thread(target=_paste_after_user_click, daemon=True).start()
         return
     if not is_recording:
@@ -583,8 +608,23 @@ def _send_cmd_v():
         return False
 
 
-def _restore_target_app_focus():
-    app_name = latest_click_app_name if click_target_ready and latest_click_app_name else saved_frontmost_app_name
+def _activate_app(bundle_id="", app_path="", app_name=""):
+    try:
+        if bundle_id:
+            subprocess.run(["open", "-b", bundle_id], check=True)
+            time.sleep(0.2)
+            return True
+    except Exception:
+        pass
+
+    try:
+        if app_path:
+            subprocess.run(["open", "-a", app_path], check=True)
+            time.sleep(0.2)
+            return True
+    except Exception:
+        pass
+
     if not app_name:
         return False
     try:
@@ -594,6 +634,20 @@ def _restore_target_app_focus():
         return True
     except Exception:
         return False
+
+
+def _restore_target_app_focus():
+    if click_target_ready:
+        return _activate_app(
+            latest_click_app_bundle_id,
+            latest_click_app_path,
+            latest_click_app_name,
+        )
+    return _activate_app(
+        saved_frontmost_app_bundle_id,
+        saved_frontmost_app_path,
+        saved_frontmost_app_name,
+    )
 
 
 def _paste_at_saved_pos():
@@ -606,8 +660,9 @@ def _paste_at_saved_pos():
 
 
 def _arm_click_to_paste(text):
-    global pending_paste_armed
+    global pending_paste_armed, pending_paste_expires_at
     pending_paste_armed = True
+    pending_paste_expires_at = time.monotonic() + PASTE_ARM_TIMEOUT_SECONDS
     subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
     notify(
         "VoiceDrop",
@@ -617,12 +672,14 @@ def _arm_click_to_paste(text):
 
 
 def _paste_after_user_click():
+    global click_target_ready
     time.sleep(0.15)
     try:
-        if latest_click_app_name:
-            script = f'tell application "{latest_click_app_name.replace(chr(34), chr(92) + chr(34))}" to activate'
-            subprocess.run(["osascript", "-e", script], check=True)
-            time.sleep(0.15)
+        _activate_app(
+            latest_click_app_bundle_id,
+            latest_click_app_path,
+            latest_click_app_name,
+        )
         ok = _send_cmd_v()
         if app:
             app.show_done()
@@ -636,6 +693,8 @@ def _paste_after_user_click():
         log_exception("deferred paste failed")
         if app:
             app.show_error("クリック後の貼り付けに失敗しました")
+    finally:
+        click_target_ready = False
 
 
 def _cancel_recording_timer():
@@ -715,6 +774,20 @@ def _is_hallucination(text: str) -> bool:
     return False
 
 
+def _is_pathologically_repetitive(text: str) -> bool:
+    normalized = _normalize_transcript_text(text)
+    if len(normalized) < 24:
+        return False
+
+    if re.search(r"(.{2,12}?)\1{3,}", normalized):
+        return True
+
+    if re.search(r"(.)\1{7,}", normalized):
+        return True
+
+    return False
+
+
 def _is_effectively_silent(audio) -> bool:
     if len(audio) == 0:
         return True
@@ -730,10 +803,12 @@ def _transcribe_audio_chunks(audio):
         audio,
         path_or_hf_repo=MLX_MODEL_REPO,
         language=LANGUAGE,
+        condition_on_previous_text=False,
+        hallucination_silence_threshold=0.2,
         initial_prompt="以下は日本語の音声です。句読点（。、）を適切に含めて文字起こししてください。",
     )
     text = result.get("text", "").strip()
-    if _is_hallucination(text):
+    if _is_hallucination(text) or _is_pathologically_repetitive(text):
         return ""
     return text
 
@@ -755,7 +830,7 @@ def start_recording():
         audio_buffer = []
         is_recording = True
         click_target_ready = False
-        pending_paste_armed = False
+        _clear_pending_paste()
         recording_started_at = time.monotonic()
         stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                                  dtype="float32", callback=audio_callback)
@@ -873,28 +948,52 @@ def _alt_held():
 def _right_alt_pressed(key):
     return key == keyboard.Key.alt_r
 
-def on_press(key):
+
+def _cancel_hotkey_reset():
+    global hotkey_reset_timer
+    if hotkey_reset_timer:
+        hotkey_reset_timer.cancel()
+        hotkey_reset_timer = None
+
+
+def _clear_hotkey_state():
     global hotkey_active
+    hotkey_active = False
+    current_keys.clear()
+    _cancel_hotkey_reset()
+
+
+def _schedule_hotkey_reset():
+    global hotkey_reset_timer
+    _cancel_hotkey_reset()
+    hotkey_reset_timer = threading.Timer(HOTKEY_STUCK_RESET_SECONDS, _clear_hotkey_state)
+    hotkey_reset_timer.daemon = True
+    hotkey_reset_timer.start()
+
+
+def _arm_hotkey_trigger():
+    global hotkey_active
+    hotkey_active = True
+    _schedule_hotkey_reset()
+    _trigger()
+
+def on_press(key):
     current_keys.add(key)
-    print(f"[KEY] {key!r}  model_ready={model_ready.is_set()}", flush=True)
 
     hk = config.get("hotkey", "right_cmd")
 
     if hk == "right_option":
         if _right_alt_pressed(key) and not hotkey_active:
-            hotkey_active = True
-            _trigger()
+            _arm_hotkey_trigger()
     elif hk == "right_cmd":
         if key == keyboard.Key.cmd_r and not hotkey_active:
-            hotkey_active = True
-            _trigger()
+            _arm_hotkey_trigger()
     elif hk == "opt_space":
         is_space = (key == keyboard.Key.space or
                     (hasattr(key, 'vk') and key.vk == 49) or
                     (hasattr(key, 'char') and key.char in (' ', '\xa0')))
         if is_space and _alt_held() and not hotkey_active:
-            hotkey_active = True
-            _trigger()
+            _arm_hotkey_trigger()
     elif hk == "ctrl_shift_space":
         ctrl  = any(k in current_keys for k in
                     (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r))
@@ -902,17 +1001,14 @@ def on_press(key):
                     (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r))
         space = keyboard.Key.space in current_keys
         if ctrl and shift and space and not hotkey_active:
-            hotkey_active = True
-            _trigger()
+            _arm_hotkey_trigger()
     elif hk == "mic_key":
         if key == keyboard.KeyCode(vk=MIC_VK) and not hotkey_active:
-            hotkey_active = True
-            _trigger()
+            _arm_hotkey_trigger()
     else:
         target = getattr(keyboard.Key, hk, keyboard.Key.f5)
         if key == target and not hotkey_active:
-            hotkey_active = True
-            _trigger()
+            _arm_hotkey_trigger()
 
 def on_release(key):
     global hotkey_active
@@ -921,14 +1017,17 @@ def on_release(key):
     if hk == "right_option":
         if _right_alt_pressed(key):
             hotkey_active = False
+            _cancel_hotkey_reset()
     elif hk == "right_cmd":
         if key == keyboard.Key.cmd_r:
             hotkey_active = False
+            _cancel_hotkey_reset()
     elif hk == "opt_space":
         if key in (keyboard.Key.space, keyboard.Key.alt,
                    keyboard.Key.alt_l, keyboard.Key.alt_r):
             if not (keyboard.Key.space in current_keys and _alt_held()):
                 hotkey_active = False
+                _cancel_hotkey_reset()
     elif hk == "ctrl_shift_space":
         ctrl  = any(k in current_keys for k in
                     (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r))
@@ -937,13 +1036,16 @@ def on_release(key):
         space = keyboard.Key.space in current_keys
         if not (ctrl and shift and space):
             hotkey_active = False
+            _cancel_hotkey_reset()
     elif hk == "mic_key":
         if key == keyboard.KeyCode(vk=MIC_VK):
             hotkey_active = False
+            _cancel_hotkey_reset()
     else:
         target = getattr(keyboard.Key, hk, keyboard.Key.f5)
         if key == target:
             hotkey_active = False
+            _cancel_hotkey_reset()
 
 
 # ══════════════════════════════════════════════════
