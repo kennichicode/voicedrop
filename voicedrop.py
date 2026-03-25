@@ -307,7 +307,10 @@ def load_term_glossary() -> dict[str, str]:
     return glossary
 
 
-def build_initial_prompt(language: str, glossary: dict[str, str]) -> str:
+def build_initial_prompt(language: str | None, glossary: dict[str, str]) -> str:
+    if not language:
+        return ""
+
     prompt_parts: list[str] = []
     if language == "ja":
         prompt_parts.append(JAPANESE_TRANSCRIPTION_PROMPT)
