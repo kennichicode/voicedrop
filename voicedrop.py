@@ -67,6 +67,8 @@ IMPORT_INBOX_DIR = IMPORT_ROOT_DIR / "Inbox"
 IMPORT_PROCESSING_DIR = IMPORT_ROOT_DIR / "Processing"
 IMPORT_PROCESSED_DIR = IMPORT_ROOT_DIR / "Processed"
 IMPORT_FAILED_DIR = IMPORT_ROOT_DIR / "Failed"
+OBSIDIAN_VAULT_DIR = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault"
+OBSIDIAN_INBOX_DIR = OBSIDIAN_VAULT_DIR / "01_Inbox"
 TERM_GLOSSARY_FILE = APP_DIR / "transcription_terms.json"
 PID_FILE = STATE_DIR / "voicedrop.pid"
 LAST_TRANSCRIPT_FILE = STATE_DIR / "last_transcript.txt"
@@ -82,6 +84,9 @@ IMPORT_SCAN_INTERVAL_SECONDS = 3.0
 IMPORT_STABILITY_SECONDS = 2.0
 STOP_OPERATION_TIMEOUT_SECONDS = float(
     os.getenv("VOICEDROP_STOP_TIMEOUT_SECONDS", "20.0")
+)
+MAX_RECORDING_SECONDS = float(
+    os.getenv("VOICEDROP_MAX_RECORDING_SECONDS", "3600")
 )
 SILENCE_RMS_THRESHOLD = 0.0035
 SILENCE_PEAK_THRESHOLD = 0.02
@@ -407,6 +412,7 @@ class TranscriptionJob:
     stamp: str = field(compare=False)
     source_path: Path | None = field(compare=False, default=None)
     archive_path: Path | None = field(compare=False, default=None)
+    output_inbox: Path | None = field(compare=False, default=None)
 
 
 class RollingAudioWriter:
@@ -575,6 +581,10 @@ class AudioRecorder:
     @property
     def is_recording(self) -> bool:
         return self._stream is not None
+
+    @property
+    def recording_stamp(self) -> str | None:
+        return self._started_stamp
 
     def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         if status:
@@ -1093,8 +1103,12 @@ class VoiceDropApp(rumps.App):
         self._active_job: TranscriptionJob | None = None
         self._queued_import_paths: set[str] = set()
         self._import_observations: dict[str, tuple[int, int]] = {}
+        self._obsidian_observations: dict[str, tuple[int, int]] = {}
         self._recording_transition_lock = threading.Lock()
         self._recording_transition: str | None = None
+        self._recording_timer_lock = threading.Lock()
+        self._recording_timer_cancel: threading.Event | None = None
+        self._recording_timer_stamp: str | None = None
         self.shortcut_monitor = RightOptionEventTap(self.toggle_recording_from_shortcut)
         self._spinner_thread = threading.Thread(
             target=self._spinner_loop,
@@ -1129,6 +1143,9 @@ class VoiceDropApp(rumps.App):
         self.open_import_inbox_button = rumps.MenuItem(
             "Open Import Inbox", callback=self.open_import_inbox
         )
+        self.open_obsidian_inbox_button = rumps.MenuItem(
+            "Open Obsidian Inbox", callback=self.open_obsidian_inbox
+        )
         self.open_import_processed_button = rumps.MenuItem(
             "Open Imported Jobs", callback=self.open_import_processed
         )
@@ -1147,6 +1164,7 @@ class VoiceDropApp(rumps.App):
             None,
             self.queue_status_button,
             self.open_import_inbox_button,
+            self.open_obsidian_inbox_button,
             self.open_import_processed_button,
             self.open_import_failed_button,
             None,
@@ -1194,6 +1212,60 @@ class VoiceDropApp(rumps.App):
     def _has_pending_work(self) -> bool:
         queued_count, active_job = self._queue_state()
         return queued_count > 0 or active_job is not None
+
+    def _cancel_recording_timeout(self) -> None:
+        with self._recording_timer_lock:
+            cancel_event = self._recording_timer_cancel
+            self._recording_timer_cancel = None
+            self._recording_timer_stamp = None
+        if cancel_event is not None:
+            cancel_event.set()
+
+    def _arm_recording_timeout(self) -> None:
+        stamp = self.recorder.recording_stamp
+        if stamp is None:
+            return
+
+        self._cancel_recording_timeout()
+        cancel_event = threading.Event()
+        with self._recording_timer_lock:
+            self._recording_timer_cancel = cancel_event
+            self._recording_timer_stamp = stamp
+
+        def watch(expected_stamp: str, completed: threading.Event) -> None:
+            if completed.wait(MAX_RECORDING_SECONDS):
+                return
+            LOGGER.warning(
+                "Maximum recording duration reached for %s; auto-stopping",
+                expected_stamp,
+            )
+            AppHelper.callAfter(self._auto_stop_recording, expected_stamp)
+
+        threading.Thread(
+            target=watch,
+            args=(stamp, cancel_event),
+            name="recording-timeout",
+            daemon=True,
+        ).start()
+
+    def _auto_stop_recording(self, expected_stamp: str) -> None:
+        with self._recording_timer_lock:
+            active_stamp = self._recording_timer_stamp
+
+        if active_stamp != expected_stamp:
+            return
+        if not self.recorder.is_recording:
+            return
+        if self.recorder.recording_stamp != expected_stamp:
+            return
+        if self._recording_transition_state() is not None:
+            return
+
+        send_notification(
+            "Recording limit reached",
+            "VoiceDrop stopped automatically after 60 minutes.",
+        )
+        self._request_stop_recording(source="auto-stop")
 
     def _spinner_loop(self) -> None:
         index = 0
@@ -1346,7 +1418,7 @@ class VoiceDropApp(rumps.App):
         )
         self._enqueue_job(job)
 
-    def _enqueue_import_job(self, audio_path: Path, stamp: str) -> None:
+    def _enqueue_import_job(self, audio_path: Path, stamp: str, output_inbox: Path | None = None) -> None:
         key = str(audio_path)
         with self._job_state_lock:
             if key in self._queued_import_paths:
@@ -1359,6 +1431,7 @@ class VoiceDropApp(rumps.App):
             audio_path=audio_path,
             stamp=stamp,
             source_path=audio_path,
+            output_inbox=output_inbox,
         )
         self._enqueue_job(job)
 
@@ -1391,7 +1464,50 @@ class VoiceDropApp(rumps.App):
                 self._scan_import_inbox()
             except Exception:
                 LOGGER.exception("Import inbox scan failed")
+            try:
+                self._scan_obsidian_inbox()
+            except Exception:
+                LOGGER.exception("Obsidian inbox scan failed")
             time.sleep(IMPORT_SCAN_INTERVAL_SECONDS)
+
+    def _scan_obsidian_inbox(self) -> None:
+        if not OBSIDIAN_INBOX_DIR.exists():
+            return
+        observations: dict[str, tuple[int, int]] = {}
+        now = time.time()
+
+        for path in sorted(OBSIDIAN_INBOX_DIR.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMPORT_EXTENSIONS:
+                continue
+
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+
+            key = str(path)
+            signature = (int(stat.st_size), int(stat.st_mtime))
+            previous = self._obsidian_observations.get(key)
+            observations[key] = signature
+
+            if now - stat.st_mtime < IMPORT_STABILITY_SECONDS or previous != signature:
+                continue
+
+            stamp, processing_path = reserve_import_processing_path(path)
+            try:
+                path.rename(processing_path)
+            except OSError:
+                try:
+                    shutil.move(str(path), str(processing_path))
+                except Exception:
+                    LOGGER.exception("Failed to move Obsidian audio into processing: %s", path)
+                    continue
+
+            LOGGER.info("Queued Obsidian audio: %s", processing_path)
+            self._enqueue_import_job(processing_path, stamp, output_inbox=OBSIDIAN_INBOX_DIR)
+            observations.pop(key, None)
+
+        self._obsidian_observations = observations
 
     def _scan_import_inbox(self) -> None:
         ensure_dirs()
@@ -1502,30 +1618,45 @@ class VoiceDropApp(rumps.App):
                 raise NoSpeechDetectedError("No speech was detected in the imported file.")
 
             label = build_transcript_label(text, fallback=fallback_label)
-            output_dir = make_unique_dir(IMPORT_PROCESSED_DIR / f"{job.stamp}_{label}")
-            transcript_path = save_transcript(
-                text,
-                stamp=job.stamp,
-                label=label,
-                directory=output_dir,
-            )
-            archived_audio_path, mp3_ready = finalize_import_audio(source_path, output_dir)
-            save_metadata(
-                output_dir / "meta.json",
-                {
-                    "stamp": job.stamp,
-                    "language": language,
-                    "backend": backend,
-                    "source_name": source_path.name,
-                    "transcript_name": transcript_path.name,
-                    "archived_audio": archived_audio_path.name,
-                    "mp3_ready": mp3_ready,
-                },
-            )
-            send_notification(
-                "Imported transcript saved",
-                f"{output_dir.name} ({language}, {backend})",
-            )
+
+            if job.output_inbox is not None:
+                # Obsidian Inbox: write .md directly into the inbox, archive audio to Desktop
+                md_name = f"{job.stamp}_{sanitize_filename_component(label, fallback='import', max_length=64)}.md"
+                transcript_path = make_unique_path(job.output_inbox / md_name)
+                transcript_path.write_text(text + "\n", encoding="utf-8")
+                LAST_TRANSCRIPT_FILE.write_text(text, encoding="utf-8")
+                LOGGER.info("Saved Obsidian transcript to %s", transcript_path)
+                output_dir = make_unique_dir(IMPORT_PROCESSED_DIR / f"{job.stamp}_{label}")
+                archived_audio_path, mp3_ready = finalize_import_audio(source_path, output_dir)
+                send_notification(
+                    "Obsidian transcript saved",
+                    f"{transcript_path.name} ({language}, {backend})",
+                )
+            else:
+                output_dir = make_unique_dir(IMPORT_PROCESSED_DIR / f"{job.stamp}_{label}")
+                transcript_path = save_transcript(
+                    text,
+                    stamp=job.stamp,
+                    label=label,
+                    directory=output_dir,
+                )
+                archived_audio_path, mp3_ready = finalize_import_audio(source_path, output_dir)
+                save_metadata(
+                    output_dir / "meta.json",
+                    {
+                        "stamp": job.stamp,
+                        "language": language,
+                        "backend": backend,
+                        "source_name": source_path.name,
+                        "transcript_name": transcript_path.name,
+                        "archived_audio": archived_audio_path.name,
+                        "mp3_ready": mp3_ready,
+                    },
+                )
+                send_notification(
+                    "Imported transcript saved",
+                    f"{output_dir.name} ({language}, {backend})",
+                )
         except NoSpeechDetectedError as exc:
             failed_dir = move_failed_import(source_path, job.stamp, str(exc))
             LOGGER.info("Imported audio discarded: %s", failed_dir)
@@ -1563,28 +1694,33 @@ class VoiceDropApp(rumps.App):
         ).start()
 
     def _finish_start_recording(self) -> None:
+        self._arm_recording_timeout()
         self._clear_recording_transition()
         self._set_title("REC")
         self._refresh_menu_state()
         send_notification("Recording", "VoiceDrop is recording from the microphone.")
 
     def _fail_start_recording(self, message: str) -> None:
+        self._cancel_recording_timeout()
         self._clear_recording_transition()
         self._set_title("VD")
         self._refresh_menu_state()
         send_notification("Recording failed", message)
 
     def _finish_stop_recording(self) -> None:
+        self._cancel_recording_timeout()
         self._clear_recording_transition()
         self._refresh_menu_state()
 
     def _discard_stop_recording(self, message: str) -> None:
+        self._cancel_recording_timeout()
         self._clear_recording_transition()
         self._set_title("VD")
         self._refresh_menu_state()
         send_notification("Discarded", message)
 
     def _fail_stop_recording(self, title: str, message: str) -> None:
+        self._cancel_recording_timeout()
         self._clear_recording_transition()
         self._set_title("VD")
         self._refresh_menu_state()
@@ -1686,6 +1822,7 @@ class VoiceDropApp(rumps.App):
         if not self._begin_recording_transition("stopping"):
             LOGGER.info("Ignoring stop request via %s during transition", source)
             return
+        self._cancel_recording_timeout()
         self._set_title("STP")
         self._refresh_menu_state()
         threading.Thread(
@@ -1712,6 +1849,9 @@ class VoiceDropApp(rumps.App):
 
     def open_import_inbox(self, _) -> None:
         open_in_finder(IMPORT_INBOX_DIR)
+
+    def open_obsidian_inbox(self, _) -> None:
+        open_in_finder(OBSIDIAN_INBOX_DIR)
 
     def open_import_processed(self, _) -> None:
         open_in_finder(IMPORT_PROCESSED_DIR)
