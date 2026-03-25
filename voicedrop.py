@@ -1495,7 +1495,12 @@ class VoiceDropApp(rumps.App):
 
             try:
                 with open(path, "rb") as f:
-                    f.read(1024)
+                    f.seek(0, 2)
+                    readable_size = f.tell()
+                if readable_size < stat.st_size:
+                    LOGGER.info("Obsidian audio not fully downloaded yet (%d/%d bytes): %s", readable_size, stat.st_size, path)
+                    observations.pop(key, None)
+                    continue
             except OSError:
                 LOGGER.info("Obsidian audio not yet readable (iCloud download in progress): %s", path)
                 observations.pop(key, None)
