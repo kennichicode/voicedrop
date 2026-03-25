@@ -1628,8 +1628,19 @@ class VoiceDropApp(rumps.App):
             max_length=32,
         )
         output_dir: Path | None = None
+        wav_path: Path | None = None
         try:
-            text, language, backend = self.transcriber.transcribe(source_path)
+            transcribe_path = source_path
+            if source_path.suffix.lower() not in {".wav", ".mp3"}:
+                wav_path = source_path.with_suffix(".wav")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(source_path), "-ar", "16000", "-ac", "1", str(wav_path)],
+                    capture_output=True,
+                    check=True,
+                )
+                transcribe_path = wav_path
+                LOGGER.info("Converted %s to wav for transcription", source_path.name)
+            text, language, backend = self.transcriber.transcribe(transcribe_path)
             if not text:
                 raise NoSpeechDetectedError("No speech was detected in the imported file.")
 
@@ -1685,6 +1696,9 @@ class VoiceDropApp(rumps.App):
                 failed_dir = move_failed_import(source_path, job.stamp, str(exc))
             LOGGER.exception("Imported transcription failed")
             send_notification("Import failed", failed_dir.name)
+        finally:
+            if wav_path is not None and wav_path.exists():
+                wav_path.unlink(missing_ok=True)
 
     def _start_stop_watchdog(self, completed: threading.Event) -> None:
         def watch() -> None:
