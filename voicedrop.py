@@ -683,7 +683,7 @@ class Transcriber:
 
         self.faster_model_name = os.getenv("VOICEDROP_MODEL", "small")
         self.faster_compute_type = os.getenv("VOICEDROP_COMPUTE_TYPE", "int8")
-        self.language = os.getenv("VOICEDROP_LANGUAGE", "ja")
+        self.language = os.getenv("VOICEDROP_LANGUAGE") or None
         self.term_glossary = load_term_glossary()
         default_prompt = build_initial_prompt(self.language, self.term_glossary)
         self.initial_prompt = os.getenv("VOICEDROP_INITIAL_PROMPT", default_prompt).strip()
