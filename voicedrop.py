@@ -1650,7 +1650,8 @@ class VoiceDropApp(rumps.App):
                 # Obsidian Inbox: write .md directly into the inbox, archive audio to Desktop
                 md_name = f"{job.stamp}_{sanitize_filename_component(label, fallback='import', max_length=64)}.md"
                 transcript_path = make_unique_path(job.output_inbox / md_name)
-                transcript_path.write_text(text + "\n", encoding="utf-8")
+                md_text = re.sub(r'([.!?。！？])\s+', r'\1\n', text)
+                transcript_path.write_text(md_text + "\n", encoding="utf-8")
                 LAST_TRANSCRIPT_FILE.write_text(text, encoding="utf-8")
                 LOGGER.info("Saved Obsidian transcript to %s", transcript_path)
                 output_dir = make_unique_dir(IMPORT_PROCESSED_DIR / f"{job.stamp}_{label}")
