@@ -761,14 +761,14 @@ class Transcriber:
         vad_filter: bool,
         beam_size: int,
         label: str,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, list]:
         model = self._get_faster_model()
         LOGGER.info(
             "Transcribing with faster-whisper (%s): %s",
             label,
             audio_path,
         )
-        segments, info = model.transcribe(
+        raw_segments, info = model.transcribe(
             str(audio_path),
             language=self.language,
             task="transcribe",
@@ -777,9 +777,10 @@ class Transcriber:
             condition_on_previous_text=False,
             initial_prompt=self.initial_prompt or None,
         )
-        text = "".join(segment.text for segment in segments).strip()
+        seg_list = [{"start": s.start, "end": s.end, "text": s.text} for s in raw_segments]
+        text = "".join(s["text"] for s in seg_list).strip()
         language = getattr(info, "language", "unknown")
-        return text, language
+        return text, language, seg_list
 
     def _transcribe_with_faster_whisper(self, audio_path: Path) -> tuple[str, str, str]:
         attempts = [
@@ -790,18 +791,18 @@ class Transcriber:
 
         last_language = "unknown"
         for attempt in attempts:
-            text, language = self._run_faster_whisper_pass(audio_path, **attempt)
+            text, language, segments = self._run_faster_whisper_pass(audio_path, **attempt)
             last_language = language
             if text:
-                return text, language, f"faster-whisper:{attempt['label']}"
+                return text, language, f"faster-whisper:{attempt['label']}", segments
             LOGGER.warning(
                 "faster-whisper returned empty text for %s",
                 attempt["label"],
             )
 
-        return "", last_language, "faster-whisper"
+        return "", last_language, "faster-whisper", []
 
-    def _transcribe_with_mlx(self, audio_path: Path) -> tuple[str, str, str]:
+    def _transcribe_with_mlx(self, audio_path: Path) -> tuple[str, str, str, list]:
         import mlx_whisper
 
         LOGGER.info("Transcribing with mlx-whisper: %s", audio_path)
@@ -815,15 +816,19 @@ class Transcriber:
             condition_on_previous_text=False,
             initial_prompt=self.initial_prompt or None,
         )
+        segments = [
+            {"start": s.get("start", 0.0), "end": s.get("end", 0.0), "text": s.get("text", "")}
+            for s in result.get("segments", [])
+        ]
         text = str(result.get("text", "")).strip()
         language = str(result.get("language", "unknown"))
-        return text, language, "mlx-whisper"
+        return text, language, "mlx-whisper", segments
 
-    def transcribe(self, audio_path: Path) -> tuple[str, str, str]:
+    def transcribe(self, audio_path: Path) -> tuple[str, str, str, list]:
         errors: list[str] = []
         for backend in (self._transcribe_with_mlx, self._transcribe_with_faster_whisper):
             try:
-                text, language, backend_name = backend(audio_path)
+                text, language, backend_name, segments = backend(audio_path)
                 if text:
                     normalized_text = normalize_transcript_text(
                         text,
@@ -840,7 +845,7 @@ class Transcriber:
                         )
                         continue
                     text = normalized_text
-                    return text, language, backend_name
+                    return text, language, backend_name, segments
                 errors.append(f"{backend_name}: empty transcript")
                 LOGGER.warning("Backend returned empty transcript: %s", backend_name)
             except Exception as exc:
@@ -852,6 +857,38 @@ class Transcriber:
         ):
             raise NoSpeechDetectedError("No speech was detected in the recording.")
         raise RuntimeError("All transcription backends failed: " + " | ".join(errors))
+
+
+OBSIDIAN_PARAGRAPH_GAP_SECONDS = float(os.getenv("VOICEDROP_PARAGRAPH_GAP", "8.0"))
+
+
+def format_transcript_for_obsidian(text: str, segments: list) -> str:
+    if not segments:
+        return re.sub(r'([.!?。！？])\s+', r'\1\n', text)
+
+    lines: list[str] = []
+    current: list[str] = []
+    prev_end: float | None = None
+
+    for seg in segments:
+        seg_text = seg.get("text", "").strip()
+        if not seg_text:
+            prev_end = seg.get("end", prev_end)
+            continue
+        gap = seg["start"] - prev_end if prev_end is not None else 0.0
+        if prev_end is not None and gap >= OBSIDIAN_PARAGRAPH_GAP_SECONDS:
+            if current:
+                lines.append(re.sub(r'([.!?。！？])\s+', r'\1\n', " ".join(current)))
+                lines.append("")
+            current = [seg_text]
+        else:
+            current.append(seg_text)
+        prev_end = seg.get("end", prev_end)
+
+    if current:
+        lines.append(re.sub(r'([.!?。！？])\s+', r'\1\n', " ".join(current)))
+
+    return "\n".join(lines)
 
 
 def save_recording(recording: RecordingResult) -> tuple[Path, Path]:
@@ -1578,7 +1615,7 @@ class VoiceDropApp(rumps.App):
         audio_path = job.audio_path
         archive_path = job.archive_path or audio_path
         try:
-            text, language, backend = self.transcriber.transcribe(audio_path)
+            text, language, backend, _segments = self.transcriber.transcribe(audio_path)
             if not text:
                 raise NoSpeechDetectedError("No speech was detected in the recording.")
 
@@ -1640,7 +1677,7 @@ class VoiceDropApp(rumps.App):
                 )
                 transcribe_path = wav_path
                 LOGGER.info("Converted %s to wav for transcription", source_path.name)
-            text, language, backend = self.transcriber.transcribe(transcribe_path)
+            text, language, backend, segments = self.transcriber.transcribe(transcribe_path)
             if not text:
                 raise NoSpeechDetectedError("No speech was detected in the imported file.")
 
@@ -1650,7 +1687,7 @@ class VoiceDropApp(rumps.App):
                 # Obsidian Inbox: write .md directly into the inbox, archive audio to Desktop
                 md_name = f"{job.stamp}_{sanitize_filename_component(label, fallback='import', max_length=64)}.md"
                 transcript_path = make_unique_path(job.output_inbox / md_name)
-                md_text = re.sub(r'([.!?。！？])\s+', r'\1\n', text)
+                md_text = format_transcript_for_obsidian(text, segments)
                 transcript_path.write_text(md_text + "\n", encoding="utf-8")
                 LAST_TRANSCRIPT_FILE.write_text(text, encoding="utf-8")
                 LOGGER.info("Saved Obsidian transcript to %s", transcript_path)
