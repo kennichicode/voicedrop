@@ -1493,6 +1493,14 @@ class VoiceDropApp(rumps.App):
             if now - stat.st_mtime < IMPORT_STABILITY_SECONDS or previous != signature:
                 continue
 
+            try:
+                with open(path, "rb") as f:
+                    f.read(1024)
+            except OSError:
+                LOGGER.info("Obsidian audio not yet readable (iCloud download in progress): %s", path)
+                observations.pop(key, None)
+                continue
+
             stamp, processing_path = reserve_import_processing_path(path)
             try:
                 path.rename(processing_path)
