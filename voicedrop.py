@@ -88,13 +88,26 @@ STOP_OPERATION_TIMEOUT_SECONDS = float(
 MAX_RECORDING_SECONDS = float(
     os.getenv("VOICEDROP_MAX_RECORDING_SECONDS", "3600")
 )
+LIVE_COMMA_GAP_SECONDS = float(
+    os.getenv("VOICEDROP_LIVE_COMMA_GAP_SECONDS", "0.55")
+)
+LIVE_SENTENCE_GAP_SECONDS = float(
+    os.getenv("VOICEDROP_LIVE_SENTENCE_GAP_SECONDS", "1.15")
+)
+LIVE_PARAGRAPH_GAP_SECONDS = float(
+    os.getenv("VOICEDROP_LIVE_PARAGRAPH_GAP_SECONDS", "4.5")
+)
+LIVE_COMMA_MIN_CHARS = int(
+    os.getenv("VOICEDROP_LIVE_COMMA_MIN_CHARS", "6")
+)
 SILENCE_RMS_THRESHOLD = 0.0035
 SILENCE_PEAK_THRESHOLD = 0.02
 SILENCE_ACTIVE_RATIO_THRESHOLD = 0.008
 JAPANESE_TRANSCRIPTION_PROMPT = (
     "以下は自然な日本語の音声文字起こしです。"
-    "句読点は「、」「。」を中心に自然に補い、"
-    "余計な半角スペースを入れずにそのまま日本語として出力してください。"
+    "句読点は「、」「。」を中心に自然に補い、文末は必要に応じて「。」で閉じてください。"
+    "話題転換や長い間があるところでは自然な改行も入れてください。"
+    "余計な半角スペースは入れず、そのまま自然な日本語として出力してください。"
 )
 DEFAULT_TERM_GLOSSARY = {
     "ボイスドロップ": "VoiceDrop",
@@ -340,7 +353,13 @@ def apply_term_glossary(text: str, glossary: dict[str, str]) -> str:
     return normalized
 
 
-def normalize_transcript_text(text: str, language: str, glossary: dict[str, str] | None = None) -> str:
+def normalize_transcript_text(
+    text: str,
+    language: str,
+    glossary: dict[str, str] | None = None,
+    *,
+    add_terminal_punctuation: bool = True,
+) -> str:
     text = text.strip()
     if not text:
         return text
@@ -362,15 +381,20 @@ def normalize_transcript_text(text: str, language: str, glossary: dict[str, str]
     text = text.replace(";", "；")
     text = re.sub(r"(?<!\d)\.(?!\d)", "。", text)
 
-    text = re.sub(r"\s*([、。！？：；])\s*", r"\1", text)
+    text = re.sub(r"[ \t]*([、。！？：；])[ \t]*", r"\1", text)
     text = re.sub(
         r"(?<=[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff々ー])\s+(?=[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff々ー])",
         "",
         text,
     )
     text = re.sub(r"([、。！？]){2,}", r"\1", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
 
-    if JAPANESE_CHAR_PATTERN.search(text) and not re.search(r"[。！？]$", text):
+    if (
+        add_terminal_punctuation
+        and JAPANESE_CHAR_PATTERN.search(text)
+        and not re.search(r"[。！？]$", text)
+    ):
         text += "。"
 
     if glossary:
@@ -860,6 +884,54 @@ class Transcriber:
 
 
 OBSIDIAN_PARAGRAPH_GAP_SECONDS = float(os.getenv("VOICEDROP_PARAGRAPH_GAP", "8.0"))
+
+
+def format_live_transcript(text: str, language: str, segments: list, glossary: dict[str, str] | None = None) -> str:
+    base_text = normalize_transcript_text(text, language, glossary=glossary)
+    is_japanese = language == "ja" or bool(JAPANESE_CHAR_PATTERN.search(base_text))
+    if not is_japanese or not segments:
+        return base_text
+
+    parts: list[str] = []
+    prev_end: float | None = None
+
+    for seg in segments:
+        seg_text = normalize_transcript_text(
+            str(seg.get("text", "")).strip(),
+            language,
+            glossary=glossary,
+            add_terminal_punctuation=False,
+        )
+        if not seg_text:
+            prev_end = seg.get("end", prev_end)
+            continue
+
+        if parts and prev_end is not None:
+            current_start = float(seg.get("start", prev_end))
+            gap = max(0.0, current_start - prev_end)
+            last = parts[-1]
+
+            if gap >= LIVE_PARAGRAPH_GAP_SECONDS:
+                if not re.search(r"[。！？]$", last):
+                    parts[-1] = last + "。"
+                parts.append("\n\n")
+            elif gap >= LIVE_SENTENCE_GAP_SECONDS:
+                if not re.search(r"[。！？]$", last):
+                    parts[-1] = last + "。"
+                parts.append("\n")
+            elif gap >= LIVE_COMMA_GAP_SECONDS:
+                visible_chars = len(re.sub(r"[\s、。！？]", "", seg_text))
+                if visible_chars >= LIVE_COMMA_MIN_CHARS and not re.search(r"[、。！？]$", last):
+                    parts[-1] = last + "、"
+
+        parts.append(seg_text)
+        prev_end = float(seg.get("end", prev_end if prev_end is not None else 0.0))
+
+    formatted = "".join(parts).strip()
+    formatted = normalize_transcript_text(formatted, language, glossary=glossary)
+    if "、" not in formatted and "。" not in formatted and "\n" not in formatted:
+        return base_text
+    return formatted
 
 
 def format_transcript_for_obsidian(text: str, segments: list) -> str:
@@ -1615,10 +1687,19 @@ class VoiceDropApp(rumps.App):
         audio_path = job.audio_path
         archive_path = job.archive_path or audio_path
         try:
-            text, language, backend, _segments = self.transcriber.transcribe(audio_path)
+            text, language, backend, segments = self.transcriber.transcribe(audio_path)
             if not text:
                 raise NoSpeechDetectedError("No speech was detected in the recording.")
 
+            formatted_text = format_live_transcript(
+                text,
+                language,
+                segments,
+                glossary=self.transcriber.term_glossary,
+            )
+            if formatted_text != text:
+                LOGGER.info("Formatted live transcript for %s", language)
+            text = formatted_text
             label = build_transcript_label(text, fallback="speech")
             final_archive_path = self._rename_live_archive(archive_path, job.stamp, label)
             transcript_path = save_transcript(text, stamp=job.stamp, label=label)
