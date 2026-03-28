@@ -109,6 +109,17 @@ JAPANESE_TRANSCRIPTION_PROMPT = (
     "話題転換や長い間があるところでは自然な改行も入れてください。"
     "余計な半角スペースは入れず、そのまま自然な日本語として出力してください。"
 )
+ENGLISH_TRANSCRIPTION_PROMPT = (
+    "Transcribe in natural English."
+    " Add punctuation and capitalization."
+    " Close complete sentences with periods, and add paragraph breaks when the speaker pauses or changes topic."
+)
+MULTILINGUAL_TRANSCRIPTION_PROMPT = (
+    "Transcribe in the language that is actually spoken."
+    " Add natural punctuation and paragraph breaks."
+    " For Japanese, use 「、」「。」."
+    " For English and other Latin-script languages, use normal punctuation such as commas and periods."
+)
 DEFAULT_TERM_GLOSSARY = {
     "ボイスドロップ": "VoiceDrop",
     "ボイス ドロップ": "VoiceDrop",
@@ -131,6 +142,7 @@ CANONICAL_ENGLISH_REPLACEMENTS = (
     (r"\boption\s+key\b", "Option key"),
 )
 JAPANESE_CHAR_PATTERN = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff々ー]")
+LATIN_CHAR_PATTERN = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]")
 HALLUCINATION_FILTER_PHRASES = {
     "ご視聴ありがとうございます",
     "ご視聴ありがとうございました",
@@ -321,12 +333,13 @@ def load_term_glossary() -> dict[str, str]:
 
 
 def build_initial_prompt(language: str | None, glossary: dict[str, str]) -> str:
-    if not language:
-        return ""
-
     prompt_parts: list[str] = []
     if language == "ja":
         prompt_parts.append(JAPANESE_TRANSCRIPTION_PROMPT)
+    elif language == "en":
+        prompt_parts.append(ENGLISH_TRANSCRIPTION_PROMPT)
+    else:
+        prompt_parts.append(MULTILINGUAL_TRANSCRIPTION_PROMPT)
 
     if glossary:
         examples = "、".join(
@@ -367,7 +380,24 @@ def normalize_transcript_text(
     text = re.sub(r"[ \t]+", " ", text)
 
     is_japanese = language == "ja" or bool(JAPANESE_CHAR_PATTERN.search(text))
+    is_latin = language == "en" or bool(LATIN_CHAR_PATTERN.search(text))
+
     if not is_japanese:
+        text = text.replace("，", ",")
+        text = text.replace("､", ",")
+        text = text.replace("｡", ".")
+        text = text.replace("．", ".")
+        text = text.replace("！", "!")
+        text = text.replace("？", "?")
+        text = re.sub(r"[ \t]*([,.;:!?])[ \t]*", r"\1 ", text)
+        text = re.sub(r"([,.;:!?]){2,}", r"\1", text)
+        text = re.sub(r" +\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = text.strip()
+        if glossary:
+            text = apply_term_glossary(text, glossary)
+        if add_terminal_punctuation and is_latin and text and not re.search(r"[.!?]$", text):
+            text += "."
         return text
 
     text = text.replace("，", "、")
@@ -889,8 +919,14 @@ OBSIDIAN_PARAGRAPH_GAP_SECONDS = float(os.getenv("VOICEDROP_PARAGRAPH_GAP", "8.0
 def format_live_transcript(text: str, language: str, segments: list, glossary: dict[str, str] | None = None) -> str:
     base_text = normalize_transcript_text(text, language, glossary=glossary)
     is_japanese = language == "ja" or bool(JAPANESE_CHAR_PATTERN.search(base_text))
-    if not is_japanese or not segments:
+    is_latin = language == "en" or bool(LATIN_CHAR_PATTERN.search(base_text))
+    if not segments or not (is_japanese or is_latin):
         return base_text
+
+    comma_char = "、" if is_japanese else ","
+    sentence_char = "。" if is_japanese else "."
+    sentence_break = "\n" if is_japanese else " "
+    paragraph_break = "\n\n"
 
     parts: list[str] = []
     prev_end: float | None = None
@@ -912,24 +948,24 @@ def format_live_transcript(text: str, language: str, segments: list, glossary: d
             last = parts[-1]
 
             if gap >= LIVE_PARAGRAPH_GAP_SECONDS:
-                if not re.search(r"[。！？]$", last):
-                    parts[-1] = last + "。"
-                parts.append("\n\n")
+                if not re.search(r"[。！？.!?]$", last):
+                    parts[-1] = last + sentence_char
+                parts.append(paragraph_break)
             elif gap >= LIVE_SENTENCE_GAP_SECONDS:
-                if not re.search(r"[。！？]$", last):
-                    parts[-1] = last + "。"
-                parts.append("\n")
+                if not re.search(r"[。！？.!?]$", last):
+                    parts[-1] = last + sentence_char
+                parts.append(sentence_break)
             elif gap >= LIVE_COMMA_GAP_SECONDS:
-                visible_chars = len(re.sub(r"[\s、。！？]", "", seg_text))
-                if visible_chars >= LIVE_COMMA_MIN_CHARS and not re.search(r"[、。！？]$", last):
-                    parts[-1] = last + "、"
+                visible_chars = len(re.sub(r"[\s、。！？,.;:!?]", "", seg_text))
+                if visible_chars >= LIVE_COMMA_MIN_CHARS and not re.search(r"[、。！？,.;:!?]$", last):
+                    parts[-1] = last + comma_char
 
         parts.append(seg_text)
         prev_end = float(seg.get("end", prev_end if prev_end is not None else 0.0))
 
     formatted = "".join(parts).strip()
     formatted = normalize_transcript_text(formatted, language, glossary=glossary)
-    if "、" not in formatted and "。" not in formatted and "\n" not in formatted:
+    if not re.search(r"[、。,.;:!?]", formatted) and "\n" not in formatted:
         return base_text
     return formatted
 
