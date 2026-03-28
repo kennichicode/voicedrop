@@ -13,6 +13,10 @@ echo "  🎙️  VoiceDrop 起動"
 echo "================================================"
 echo ""
 
+# quarantine 除去（インストール後に開けない場合の対策）
+xattr -d com.apple.quarantine "$APP_DIR"/*.command 2>/dev/null || true
+xattr -d com.apple.quarantine "$APP_DIR"/*.sh 2>/dev/null || true
+
 # すでに起動中なら終了
 if [ -f "$PID_FILE" ]; then
   PID="$(tr -d '[:space:]' < "$PID_FILE")"
