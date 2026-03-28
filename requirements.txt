@@ -1,0 +1,8 @@
+numpy
+rumps
+sounddevice
+scipy
+pyobjc-core
+pyobjc-framework-Cocoa
+pyobjc-framework-ApplicationServices
+pyobjc-framework-Quartz
