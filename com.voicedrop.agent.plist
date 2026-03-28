@@ -12,7 +12,7 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/opt/homebrew/bin/python3.12</string>
+    <string>__APP_DIR__/venv/bin/python3</string>
     <string>__APP_DIR__/voicedrop.py</string>
   </array>
 
