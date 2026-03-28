@@ -1,53 +1,135 @@
-# VoiceDrop
+# 🎙️ VoiceDrop
 
-VoiceDrop is a macOS menu bar recorder and transcription tool for Japanese dictation on Apple Silicon Macs.
+声を話すだけで、文字にしてクリップボードに貼り付けてくれるMacのメニューバーアプリです。
+AIによるローカル音声認識（Whisper）を使用するため、**音声データがインターネットに送信されることはありません。**
 
-## Current Version
+---
 
-- Date: `2026-03-25`
-- Status: current version
+## 動作環境
 
-Added dual-inbox support: audio dropped into Obsidian's `01_Inbox` is now transcribed automatically alongside the existing Desktop inbox.
+| 項目 | 要件 |
+|------|------|
+| OS | macOS 12 Monterey 以降 |
+| CPU | Apple Silicon（M1〜）を推奨 / Intel Macでも動作可 |
+| 空き容量 | 約3GB（Whisperモデル含む） |
+| ネット | 初回インストール時のみ必要 |
 
-### Dual Inbox
+---
 
-**Desktop Inbox** (unchanged):
-- Drop audio into `Desktop/VoiceDrop Transcripts/Import/Inbox/`
-- Transcript (`.txt`), archived audio (`.mp3`), and `meta.json` are written to `Desktop/VoiceDrop Transcripts/Import/Processed/{folder}/`
+## インストール
 
-**Obsidian Inbox** (new):
-- Drop audio into the Obsidian Vault `01_Inbox/` (works from iPhone via iCloud)
-- Transcript is written directly into `01_Inbox/` as a `.md` file
-- Audio is archived to `Desktop/VoiceDrop Transcripts/Import/Processed/` as MP3
-- Menu bar includes "Open Obsidian Inbox" shortcut
+### 1. フォルダをどこかに置く
 
-Both inboxes are scanned every 3 seconds. Files are only picked up once stable (unchanged for 2 seconds) to avoid partial reads from iCloud sync.
+ダウンロードした `voice-drop` フォルダを、使い続けたい場所に移動してください。
+（例：ホームフォルダ、書類フォルダなど）
+**インストール後にフォルダを移動すると起動しなくなります。**
 
-### Previous features (retained)
+### 2. Install.command をダブルクリック
 
-- Audio files dropped into `Desktop/VoiceDrop Transcripts/Import/Inbox` are picked up automatically.
-- Imported files are transcribed in the background while normal live recording can still be started from the menu bar or the Right Option shortcut.
-- Imported `wav` files are converted to `mp3` automatically.
-- The original `wav` file is deleted only after MP3 conversion is confirmed.
-- If conversion fails or the app crashes during processing, the original file is kept.
-- Recording start and stop now run off the main UI thread.
-- Repeated shortcut presses during start or stop are ignored to avoid transition races.
-- If stopping a recording gets stuck for too long, VoiceDrop exits and relaunches automatically through `launchd`.
+`Install.command` をダブルクリックしてください。
+ターミナルが開き、以下を自動でインストールします：
 
-## Previous Stable Version
+- Homebrew（パッケージ管理）
+- Python 3.12
+- ffmpeg（音声変換）
+- 必要なPythonパッケージ一式
+- Whisper音声認識モデル（Apple Silicon: mlx-whisper / Intel: faster-whisper）
 
-- Commit: `37ff9a1`
-- Date: `2026-03-25`
-- Status: last stable version before Obsidian inbox support
+> ⚠️ 途中でパスワードを求められたら、Macのログインパスワードを入力してください。
+> ⚠️ 初回は通信量・時間がかかります（目安：5〜15分）。
 
-This is the final stable version before the background import queue was added.
+### 3. 完了
 
-- Live recording works from the menu bar and Right Option toggle shortcut.
-- Recordings are saved safely in rolling chunks so partial audio can survive a crash.
-- Finished recordings are archived as MP3.
-- Transcripts are saved and pasted automatically.
+「セットアップ完了」と表示されたらインストール終了です。
 
-## Notes
+---
 
-- The current production code is `voicedrop.py`.
-- The desktop launcher starts the Python app from this repository.
+## 起動方法
+
+`VoiceDrop Launcher.app` をダブルクリックしてください。
+メニューバーに 🎙️ アイコンが表示されれば起動成功です。
+
+> 初回起動時のみ、Whisperモデル（約1.5GB）をダウンロードします。
+> ダウンロード中はメニューバーに「Loading...」と表示されます。
+
+---
+
+## 使い方
+
+### ライブ録音（その場で話して文字起こし）
+
+| 操作 | 方法 |
+|------|------|
+| 録音開始 | **右Optionキー**を押す（または🎙️メニュー → Start Recording） |
+| 録音停止 | もう一度**右Optionキー**を押す |
+| 結果 | 文字起こしが自動でクリップボードにコピーされる |
+
+録音中はメニューバーのアイコンが変わります。テキストエディタやメモ帳を開いてCmd+Vで貼り付けできます。
+
+### ファイルから文字起こし（ドロップ）
+
+音声ファイルを以下のフォルダに入れると、自動で文字起こしされます：
+
+```
+デスクトップ/VoiceDrop Transcripts/Import/Inbox/
+```
+
+対応形式：`.mp3` `.wav` `.m4a` `.aac` `.flac` `.ogg`
+
+文字起こし結果と音声ファイルは以下に保存されます：
+
+```
+デスクトップ/VoiceDrop Transcripts/Import/Processed/（日付フォルダ）/
+  ├── transcript.txt   ← 文字起こし
+  ├── audio.mp3        ← 音声（MP3変換済み）
+  └── meta.json        ← 処理情報
+```
+
+---
+
+## アクセシビリティの許可（初回のみ）
+
+初回起動時に「アクセシビリティのアクセスを求めています」というダイアログが出ます。
+右Optionキーのショートカットを使うために必要です。
+
+1. 「システム設定を開く」をクリック
+2. プライバシーとセキュリティ → アクセシビリティ
+3. VoiceDrop（またはPython）をオンにする
+
+---
+
+## メニューバーの操作一覧
+
+| メニュー項目 | 内容 |
+|---|---|
+| Start Recording | 録音開始 |
+| Stop Recording | 録音停止 |
+| Transcripts Folder | 文字起こし保存フォルダを開く |
+| Quit | アプリ終了 |
+
+---
+
+## トラブルシューティング
+
+**起動しない**
+→ `voice-drop` フォルダを移動していないか確認してください。
+→ `Install.command` を再実行してください。
+
+**右Optionキーが反応しない**
+→ システム設定 → プライバシーとセキュリティ → アクセシビリティ にVoiceDropの許可があるか確認。
+
+**文字起こしが始まらない**
+→ 初回起動時はモデルダウンロード中のため数分かかります。
+→ メニューバーに「Loading...」が表示されている間はお待ちください。
+
+**アンインストールしたい**
+→ `voice-drop` フォルダをゴミ箱に入れるだけです。
+→ Homebrew/Python/ffmpegはそのまま残ります（他のアプリと共有している可能性があるため）。
+
+---
+
+## 注意事項
+
+- **Mac専用**です。Windowsでは動作しません。
+- 音声認識はすべてMac本体で処理されます。音声データは外部に送信されません。
+- 文字起こしの精度はWhisperモデルの性能に依存します。日本語に最適化されています。
