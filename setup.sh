@@ -76,13 +76,18 @@ else
   venv/bin/pip install faster-whisper --quiet
 fi
 
-chmod +x launch_voicedrop.sh
-chmod +x Install.command 2>/dev/null || true
+chmod +x launch_voicedrop.sh run.sh start.sh
 chmod +x *.command 2>/dev/null || true
 
-# Gatekeeperの quarantine 属性を除去（ダブルクリックで開けるようにする）
-xattr -d com.apple.quarantine *.command 2>/dev/null || true
-xattr -d com.apple.quarantine *.sh 2>/dev/null || true
+# Gatekeeper quarantine 除去
+xattr -dr com.apple.quarantine . 2>/dev/null || true
+
+# VoiceDrop Launcher.app を作成
+if [ -f "launcher.applescript" ]; then
+  echo "🔨 VoiceDrop Launcher.app を作成中..."
+  osacompile -o "VoiceDrop Launcher.app" launcher.applescript
+  echo "✅ VoiceDrop Launcher.app 作成完了"
+fi
 
 echo ""
 echo "================================================"

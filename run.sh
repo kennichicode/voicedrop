@@ -1,3 +1,3 @@
 #!/bin/bash
 cd "$(dirname "$0")"
-/opt/homebrew/bin/python3.12 voicedrop.py
+"$(dirname "$0")/venv/bin/python3" voicedrop.py
