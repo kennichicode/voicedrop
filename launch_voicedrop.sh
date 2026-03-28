@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-APP_DIR="/Users/kenichikawabata/Documents/Claude/Tools/voice-drop"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="/opt/homebrew/bin/python3.12"
 SCRIPT_PATH="$APP_DIR/voicedrop.py"
 AGENT_SOURCE="$APP_DIR/com.voicedrop.agent.plist"
@@ -32,8 +32,8 @@ if [[ ! -f "$AGENT_SOURCE" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$AGENT_PATH" ]] || ! cmp -s "$AGENT_SOURCE" "$AGENT_PATH"; then
-  cp "$AGENT_SOURCE" "$AGENT_PATH"
+if [[ ! -f "$AGENT_PATH" ]] || ! grep -q "$APP_DIR" "$AGENT_PATH" 2>/dev/null; then
+  sed -e "s|__APP_DIR__|$APP_DIR|g" -e "s|__HOME__|$HOME|g" "$AGENT_SOURCE" > "$AGENT_PATH"
   launchctl bootout "$GUI_DOMAIN" "$AGENT_PATH" >/dev/null 2>&1 || true
 fi
 

@@ -13,11 +13,11 @@
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/python3.12</string>
-    <string>/Users/kenichikawabata/Documents/Claude/Tools/voice-drop/voicedrop.py</string>
+    <string>__APP_DIR__/voicedrop.py</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/kenichikawabata/Documents/Claude/Tools/voice-drop</string>
+  <string>__APP_DIR__</string>
 
   <key>EnvironmentVariables</key>
   <dict>
@@ -39,9 +39,9 @@
   </dict>
 
   <key>StandardOutPath</key>
-  <string>/Users/kenichikawabata/Library/Logs/VoiceDrop/launcher.log</string>
+  <string>__HOME__/Library/Logs/VoiceDrop/launcher.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/kenichikawabata/Library/Logs/VoiceDrop/launcher.log</string>
+  <string>__HOME__/Library/Logs/VoiceDrop/launcher.log</string>
 </dict>
 </plist>

@@ -1,4 +1,5 @@
-set appDir to "/Users/kenichikawabata/Documents/Claude/Tools/voice-drop"
+set myPath to POSIX path of (path to me)
+set appDir to do shell script "dirname " & quoted form of myPath
 set launchScript to appDir & "/launch_voicedrop.sh"
 
 try
