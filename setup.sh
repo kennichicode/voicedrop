@@ -78,6 +78,11 @@ fi
 
 chmod +x launch_voicedrop.sh
 chmod +x Install.command 2>/dev/null || true
+chmod +x *.command 2>/dev/null || true
+
+# Gatekeeperの quarantine 属性を除去（ダブルクリックで開けるようにする）
+xattr -d com.apple.quarantine *.command 2>/dev/null || true
+xattr -d com.apple.quarantine *.sh 2>/dev/null || true
 
 echo ""
 echo "================================================"
