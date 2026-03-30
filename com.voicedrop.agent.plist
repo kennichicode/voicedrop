@@ -26,7 +26,7 @@
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
     <key>VOICEDROP_MLX_MODEL</key>
-    <string>mlx-community/whisper-large-v3-turbo</string>
+    <string>mlx-community/whisper-small-mlx</string>
   </dict>
 
   <key>ProcessType</key>
