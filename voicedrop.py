@@ -88,7 +88,7 @@ AUDIO_ARCHIVE_BITRATE = os.getenv("VOICEDROP_AUDIO_BITRATE", "192k")
 IMPORT_SCAN_INTERVAL_SECONDS = 3.0
 IMPORT_STABILITY_SECONDS = 2.0
 STOP_OPERATION_TIMEOUT_SECONDS = float(
-    os.getenv("VOICEDROP_STOP_TIMEOUT_SECONDS", "20.0")
+    os.getenv("VOICEDROP_STOP_TIMEOUT_SECONDS", "5.0")
 )
 MAX_RECORDING_SECONDS = float(
     os.getenv("VOICEDROP_MAX_RECORDING_SECONDS", "3600")
@@ -701,10 +701,15 @@ class AudioRecorder:
         self._stream = None
         writer = self._writer
         self._writer = None
+        # stream.stop() can deadlock in PortAudio when called shortly after start.
+        # Run it in a daemon thread with a timeout so the stop never hangs forever.
+        _stop_thread = threading.Thread(target=stream.stop, daemon=True)
+        _stop_thread.start()
+        _stop_thread.join(timeout=3.0)
         try:
-            stream.stop()
-        finally:
             stream.close()
+        except Exception:
+            pass
 
         duration_seconds = time.time() - self._started_at
         self._started_at = None
