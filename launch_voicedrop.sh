@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON_BIN="$APP_DIR/venv/bin/python3"
 SCRIPT_PATH="$APP_DIR/voicedrop.py"
 AGENT_SOURCE="$APP_DIR/com.voicedrop.agent.plist"
