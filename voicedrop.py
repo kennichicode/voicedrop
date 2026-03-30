@@ -74,6 +74,11 @@ PID_FILE = STATE_DIR / "voicedrop.pid"
 LAST_TRANSCRIPT_FILE = STATE_DIR / "last_transcript.txt"
 LAST_AUDIO_FILE = STATE_DIR / "last_recording.wav"
 LOG_FILE = LOG_DIR / "voicedrop.log"
+MODEL_PREF_FILE = STATE_DIR / "model_preference.txt"
+MODEL_OPTIONS = [
+    ("mlx-community/whisper-small-mlx", "Small (軽量 ~300MB)"),
+    ("mlx-community/whisper-large-v3-turbo", "Large v3 Turbo (高精度 ~1.5GB)"),
+]
 SAMPLE_RATE = 16_000
 MIN_RECORDING_SECONDS = 0.35
 RIGHT_OPTION_KEYCODE = 61
@@ -744,8 +749,9 @@ class Transcriber:
         self.term_glossary = load_term_glossary()
         default_prompt = build_initial_prompt(self.language, self.term_glossary)
         self.initial_prompt = os.getenv("VOICEDROP_INITIAL_PROMPT", default_prompt).strip()
-        self.mlx_model_name = os.getenv(
-            "VOICEDROP_MLX_MODEL", "mlx-community/whisper-small"
+        _saved_model = MODEL_PREF_FILE.read_text().strip() if MODEL_PREF_FILE.exists() else None
+        self.mlx_model_name = _saved_model or os.getenv(
+            "VOICEDROP_MLX_MODEL", "mlx-community/whisper-small-mlx"
         )
 
     def start_warmup(self) -> None:
@@ -1306,6 +1312,19 @@ class VoiceDropApp(rumps.App):
         )
         self.self_check_button = rumps.MenuItem("Self Check", callback=self.self_check)
 
+        self.model_small_item = rumps.MenuItem(
+            "  Small (軽量 ~300MB)",
+            callback=lambda _: self._switch_model("mlx-community/whisper-small-mlx"),
+        )
+        self.model_large_item = rumps.MenuItem(
+            "  Large v3 Turbo (高精度 ~1.5GB)",
+            callback=lambda _: self._switch_model("mlx-community/whisper-large-v3-turbo"),
+        )
+        self.model_menu = rumps.MenuItem("モデル切り替え")
+        self.model_menu.add(self.model_small_item)
+        self.model_menu.add(self.model_large_item)
+        self._update_model_checkmarks()
+
         self.menu = [
             self.start_button,
             self.stop_button,
@@ -1323,6 +1342,8 @@ class VoiceDropApp(rumps.App):
             self.open_logs_button,
             self.copy_last_button,
             self.self_check_button,
+            None,
+            self.model_menu,
         ]
 
         self._start_shortcut_monitor()
@@ -1496,6 +1517,29 @@ class VoiceDropApp(rumps.App):
         except Exception:
             LOGGER.exception("Failed to query Accessibility trust")
             return False
+
+    def _update_model_checkmarks(self) -> None:
+        current = self.transcriber.mlx_model_name
+        self.model_small_item.title = (
+            "✓ Small (軽量 ~300MB)"
+            if current == "mlx-community/whisper-small-mlx"
+            else "  Small (軽量 ~300MB)"
+        )
+        self.model_large_item.title = (
+            "✓ Large v3 Turbo (高精度 ~1.5GB)"
+            if current == "mlx-community/whisper-large-v3-turbo"
+            else "  Large v3 Turbo (高精度 ~1.5GB)"
+        )
+
+    def _switch_model(self, model_id: str) -> None:
+        if model_id == self.transcriber.mlx_model_name:
+            return
+        MODEL_PREF_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MODEL_PREF_FILE.write_text(model_id)
+        label = next((lbl for mid, lbl in MODEL_OPTIONS if mid == model_id), model_id)
+        send_notification("モデル切り替え", f"{label} に切り替えます。再起動します…")
+        time.sleep(1.5)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _start_shortcut_monitor(self) -> None:
         if not self._shortcut_is_trusted():
