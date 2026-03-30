@@ -76,8 +76,8 @@ LAST_AUDIO_FILE = STATE_DIR / "last_recording.wav"
 LOG_FILE = LOG_DIR / "voicedrop.log"
 MODEL_PREF_FILE = STATE_DIR / "model_preference.txt"
 MODEL_OPTIONS = [
-    ("mlx-community/whisper-small-mlx", "Small (軽量 ~300MB)"),
-    ("mlx-community/whisper-large-v3-turbo", "Large v3 Turbo (高精度 ~1.5GB)"),
+    ("mlx-community/whisper-small-mlx", "Small (~300MB, faster)"),
+    ("mlx-community/whisper-large-v3-turbo", "Large v3 Turbo (~1.5GB, best accuracy)"),
 ]
 SAMPLE_RATE = 16_000
 MIN_RECORDING_SECONDS = 0.35
@@ -1313,14 +1313,14 @@ class VoiceDropApp(rumps.App):
         self.self_check_button = rumps.MenuItem("Self Check", callback=self.self_check)
 
         self.model_small_item = rumps.MenuItem(
-            "  Small (軽量 ~300MB)",
+            "  Small (~300MB, faster)",
             callback=lambda _: self._switch_model("mlx-community/whisper-small-mlx"),
         )
         self.model_large_item = rumps.MenuItem(
-            "  Large v3 Turbo (高精度 ~1.5GB)",
+            "  Large v3 Turbo (~1.5GB, best accuracy)",
             callback=lambda _: self._switch_model("mlx-community/whisper-large-v3-turbo"),
         )
-        self.model_menu = rumps.MenuItem("モデル切り替え")
+        self.model_menu = rumps.MenuItem("Model")
         self.model_menu.add(self.model_small_item)
         self.model_menu.add(self.model_large_item)
         self._update_model_checkmarks()
@@ -1521,14 +1521,14 @@ class VoiceDropApp(rumps.App):
     def _update_model_checkmarks(self) -> None:
         current = self.transcriber.mlx_model_name
         self.model_small_item.title = (
-            "✓ Small (軽量 ~300MB)"
+            "✓ Small (~300MB, faster)"
             if current == "mlx-community/whisper-small-mlx"
-            else "  Small (軽量 ~300MB)"
+            else "  Small (~300MB, faster)"
         )
         self.model_large_item.title = (
-            "✓ Large v3 Turbo (高精度 ~1.5GB)"
+            "✓ Large v3 Turbo (~1.5GB, best accuracy)"
             if current == "mlx-community/whisper-large-v3-turbo"
-            else "  Large v3 Turbo (高精度 ~1.5GB)"
+            else "  Large v3 Turbo (~1.5GB, best accuracy)"
         )
 
     def _switch_model(self, model_id: str) -> None:
@@ -1537,7 +1537,7 @@ class VoiceDropApp(rumps.App):
         MODEL_PREF_FILE.parent.mkdir(parents=True, exist_ok=True)
         MODEL_PREF_FILE.write_text(model_id)
         label = next((lbl for mid, lbl in MODEL_OPTIONS if mid == model_id), model_id)
-        send_notification("モデル切り替え", f"{label} に切り替えます。再起動します…")
+        send_notification("Model Switch", f"Switching to {label}. Restarting…")
         time.sleep(1.5)
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
