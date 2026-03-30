@@ -1,135 +1,157 @@
-# 🎙️ VoiceDrop
+# VoiceDrop
 
-声を話すだけで、文字にしてクリップボードに貼り付けてくれるMacのメニューバーアプリです。
-AIによるローカル音声認識（Whisper）を使用するため、**音声データがインターネットに送信されることはありません。**
-
----
-
-## 動作環境
-
-| 項目 | 要件 |
-|------|------|
-| OS | macOS 12 Monterey 以降 |
-| CPU | Apple Silicon（M1〜）を推奨 / Intel Macでも動作可 |
-| 空き容量 | 約3GB（Whisperモデル含む） |
-| ネット | 初回インストール時のみ必要 |
+A macOS menu bar app that transcribes your speech and copies it to the clipboard instantly.
+All processing happens locally using Whisper AI — **your audio is never sent to the internet.**
 
 ---
 
-## インストール
+## Requirements
 
-### 1. フォルダをどこかに置く
-
-ダウンロードした `voice-drop` フォルダを、使い続けたい場所に移動してください。
-（例：ホームフォルダ、書類フォルダなど）
-**インストール後にフォルダを移動すると起動しなくなります。**
-
-### 2. Install.command をダブルクリック
-
-`Install.command` をダブルクリックしてください。
-ターミナルが開き、以下を自動でインストールします：
-
-- Homebrew（パッケージ管理）
-- Python 3.12
-- ffmpeg（音声変換）
-- 必要なPythonパッケージ一式
-- Whisper音声認識モデル（Apple Silicon: mlx-whisper / Intel: faster-whisper）
-
-> ⚠️ 途中でパスワードを求められたら、Macのログインパスワードを入力してください。
-> ⚠️ 初回は通信量・時間がかかります（目安：5〜15分）。
-
-### 3. 完了
-
-「セットアップ完了」と表示されたらインストール終了です。
-
----
-
-## 起動方法
-
-`VoiceDrop Launcher.app` をダブルクリックしてください。
-メニューバーに 🎙️ アイコンが表示されれば起動成功です。
-
-> 初回起動時のみ、Whisperモデル（約1.5GB）をダウンロードします。
-> ダウンロード中はメニューバーに「Loading...」と表示されます。
-
----
-
-## 使い方
-
-### ライブ録音（その場で話して文字起こし）
-
-| 操作 | 方法 |
-|------|------|
-| 録音開始 | **右Optionキー**を押す（または🎙️メニュー → Start Recording） |
-| 録音停止 | もう一度**右Optionキー**を押す |
-| 結果 | 文字起こしが自動でクリップボードにコピーされる |
-
-録音中はメニューバーのアイコンが変わります。テキストエディタやメモ帳を開いてCmd+Vで貼り付けできます。
-
-### ファイルから文字起こし（ドロップ）
-
-音声ファイルを以下のフォルダに入れると、自動で文字起こしされます：
-
-```
-デスクトップ/VoiceDrop Transcripts/Import/Inbox/
-```
-
-対応形式：`.mp3` `.wav` `.m4a` `.aac` `.flac` `.ogg`
-
-文字起こし結果と音声ファイルは以下に保存されます：
-
-```
-デスクトップ/VoiceDrop Transcripts/Import/Processed/（日付フォルダ）/
-  ├── transcript.txt   ← 文字起こし
-  ├── audio.mp3        ← 音声（MP3変換済み）
-  └── meta.json        ← 処理情報
-```
-
----
-
-## アクセシビリティの許可（初回のみ）
-
-初回起動時に「アクセシビリティのアクセスを求めています」というダイアログが出ます。
-右Optionキーのショートカットを使うために必要です。
-
-1. 「システム設定を開く」をクリック
-2. プライバシーとセキュリティ → アクセシビリティ
-3. VoiceDrop（またはPython）をオンにする
-
----
-
-## メニューバーの操作一覧
-
-| メニュー項目 | 内容 |
+| | |
 |---|---|
-| Start Recording | 録音開始 |
-| Stop Recording | 録音停止 |
-| Transcripts Folder | 文字起こし保存フォルダを開く |
-| Quit | アプリ終了 |
+| OS | macOS 12 Monterey or later |
+| CPU | Apple Silicon (M1+) recommended — Intel Mac also supported |
+| Disk | ~500MB (includes Whisper model) |
+| Network | Required for initial install only |
 
 ---
 
-## トラブルシューティング
+## Installation
 
-**起動しない**
-→ `voice-drop` フォルダを移動していないか確認してください。
-→ `Install.command` を再実行してください。
+### 1. Place the folder somewhere permanent
 
-**右Optionキーが反応しない**
-→ システム設定 → プライバシーとセキュリティ → アクセシビリティ にVoiceDropの許可があるか確認。
+Move the `voicedrop` folder to where you want to keep it (e.g. Documents, home folder).
 
-**文字起こしが始まらない**
-→ 初回起動時はモデルダウンロード中のため数分かかります。
-→ メニューバーに「Loading...」が表示されている間はお待ちください。
+> ⚠️ **Do not move the folder after installing.** The launcher will break if you do.
 
-**アンインストールしたい**
-→ `voice-drop` フォルダをゴミ箱に入れるだけです。
-→ Homebrew/Python/ffmpegはそのまま残ります（他のアプリと共有している可能性があるため）。
+### 2. Run Install.command
+
+**Right-click `Install.command` → Open.**
+
+> ⚠️ Double-clicking may only show "Move to Trash". Always use **right-click → Open**.
+> ⚠️ If macOS says "developer cannot be verified", click **Open**.
+
+A Terminal window will open and automatically install:
+
+- Homebrew
+- Python 3.12
+- ffmpeg
+- Required Python packages
+- Whisper speech recognition (Apple Silicon: mlx-whisper / Intel: faster-whisper)
+
+> ⚠️ You may be asked for your Mac login password.
+> ⚠️ First install takes 5–15 minutes.
+
+### 3. Done
+
+When you see **"Setup complete!"**, installation is finished.
+
+A `VoiceDrop.command` launcher with a microphone icon is automatically created on your **Desktop**.
 
 ---
 
-## 注意事項
+## Launching
 
-- **Mac専用**です。Windowsでは動作しません。
-- 音声認識はすべてMac本体で処理されます。音声データは外部に送信されません。
-- 文字起こしの精度はWhisperモデルの性能に依存します。日本語に最適化されています。
+Double-click **`VoiceDrop.command`** on your Desktop.
+A Terminal window flashes briefly, then a 🎙️ icon appears in your menu bar.
+
+> On first launch, the Whisper model (~300MB) downloads automatically. This takes a few seconds.
+
+---
+
+## Usage
+
+### Live recording
+
+| Action | How |
+|---|---|
+| Start recording | Press **Right Option key** (or menu bar 🎙️ → Start Recording) |
+| Stop recording | Press **Right Option key** again |
+| Result | Transcript is copied to clipboard automatically |
+
+The menu bar icon changes while recording. Open any text field and press Cmd+V to paste.
+
+### Transcribe an audio file
+
+Drop an audio file into this folder:
+
+```
+Desktop/VoiceDrop Transcripts/Import/Inbox/
+```
+
+Supported formats: `.mp3` `.wav` `.m4a` `.aac` `.flac` `.ogg`
+
+Output is saved to:
+
+```
+Desktop/VoiceDrop Transcripts/Import/Processed/(date)/
+  ├── transcript.txt
+  ├── audio.mp3
+  └── meta.json
+```
+
+---
+
+## Accessibility permission (first launch only)
+
+VoiceDrop needs Accessibility access to detect the Right Option key shortcut.
+
+1. Click **Open System Settings** in the prompt
+2. Go to Privacy & Security → Accessibility
+3. Enable VoiceDrop (or Python)
+
+---
+
+## Menu reference
+
+| Item | Description |
+|---|---|
+| Start Recording | Start recording |
+| Stop Recording | Stop recording |
+| Open Transcripts Folder | Open the transcripts folder |
+| Model | Switch Whisper model (see below) |
+| Quit | Quit VoiceDrop |
+
+### Switching models
+
+Go to **Model** in the menu bar to choose:
+
+| Model | Memory | Notes |
+|---|---|---|
+| ✓ Small (~300MB, faster) | ~300MB | Default. Fast, accurate for most use cases |
+| Large v3 Turbo (~1.5GB, best accuracy) | ~1.5GB | Best accuracy for long recordings and technical terms |
+
+Switching models restarts VoiceDrop automatically. Both models are never loaded at the same time.
+
+---
+
+## Troubleshooting
+
+**Install.command won't open (only shows "Move to Trash")**
+→ Use **right-click → Open** instead of double-clicking.
+
+**VoiceDrop doesn't launch**
+→ Re-run `Install.command` to recreate the Desktop launcher.
+→ Make sure you haven't moved the `voicedrop` folder since installing.
+
+**Right Option key doesn't respond**
+→ Check System Settings → Privacy & Security → Accessibility and make sure VoiceDrop (or Python) is enabled.
+
+**Transcription doesn't start**
+→ On first launch, the model is downloading. Wait a few seconds.
+→ While downloading, the menu bar shows "Loading...".
+
+**Uninstalling**
+→ Drag the `voicedrop` folder to the Trash.
+→ Homebrew, Python, and ffmpeg remain (they may be shared with other apps).
+
+---
+
+## Changelog
+
+### v1.1.0 (2026-03-31)
+- **Reduced memory usage**: Default model switched from `whisper-large-v3-turbo` (~1.5GB) to `whisper-small-mlx` (~300MB) — roughly 1/4 the memory footprint
+- **Model switcher**: Switch between Small and Large v3 Turbo from the menu bar. Switching restarts the process so memory is fully released
+
+### v1.0.0
+- Initial release
