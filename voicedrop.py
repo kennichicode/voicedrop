@@ -745,7 +745,7 @@ class Transcriber:
         default_prompt = build_initial_prompt(self.language, self.term_glossary)
         self.initial_prompt = os.getenv("VOICEDROP_INITIAL_PROMPT", default_prompt).strip()
         self.mlx_model_name = os.getenv(
-            "VOICEDROP_MLX_MODEL", "mlx-community/whisper-large-v3-turbo"
+            "VOICEDROP_MLX_MODEL", "mlx-community/whisper-small"
         )
 
     def start_warmup(self) -> None:
