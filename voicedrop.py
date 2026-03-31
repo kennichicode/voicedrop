@@ -74,6 +74,7 @@ PID_FILE = STATE_DIR / "voicedrop.pid"
 LAST_TRANSCRIPT_FILE = STATE_DIR / "last_transcript.txt"
 LAST_AUDIO_FILE = STATE_DIR / "last_recording.wav"
 LOG_FILE = LOG_DIR / "voicedrop.log"
+RESOURCE_LOG_FILE = LOG_DIR / "resource.log"
 MODEL_PREF_FILE = STATE_DIR / "model_preference.txt"
 MODEL_OPTIONS = [
     ("mlx-community/whisper-small-mlx", "Small (~300MB, faster)"),
@@ -89,6 +90,12 @@ IMPORT_SCAN_INTERVAL_SECONDS = 3.0
 IMPORT_STABILITY_SECONDS = 2.0
 STOP_OPERATION_TIMEOUT_SECONDS = float(
     os.getenv("VOICEDROP_STOP_TIMEOUT_SECONDS", "5.0")
+)
+RESOURCE_LOG_INTERVAL_SECONDS = float(
+    os.getenv("VOICEDROP_RESOURCE_LOG_INTERVAL_SECONDS", "1.0")
+)
+RESOURCE_IDLE_SNAPSHOT_DELAY_SECONDS = float(
+    os.getenv("VOICEDROP_RESOURCE_IDLE_SNAPSHOT_DELAY_SECONDS", "2.0")
 )
 MAX_RECORDING_SECONDS = float(
     os.getenv("VOICEDROP_MAX_RECORDING_SECONDS", "3600")
@@ -108,6 +115,9 @@ LIVE_COMMA_MIN_CHARS = int(
 SILENCE_RMS_THRESHOLD = 0.0035
 SILENCE_PEAK_THRESHOLD = 0.02
 SILENCE_ACTIVE_RATIO_THRESHOLD = 0.008
+SILENCE_CLICKY_PEAK_THRESHOLD = SILENCE_PEAK_THRESHOLD * 3.0
+SILENCE_CLICKY_RMS_THRESHOLD = SILENCE_RMS_THRESHOLD * 0.5
+SILENCE_CLICKY_ACTIVE_RATIO_THRESHOLD = SILENCE_ACTIVE_RATIO_THRESHOLD * 0.25
 JAPANESE_TRANSCRIPTION_PROMPT = (
     "以下は自然な日本語の音声文字起こしです。"
     "句読点は「、」「。」を中心に自然に補い、文末は必要に応じて「。」で閉じてください。"
@@ -165,6 +175,7 @@ SUPPORTED_IMPORT_EXTENSIONS = {
 }
 
 LOGGER = logging.getLogger(APP_NAME)
+RESOURCE_LOGGER = logging.getLogger(f"{APP_NAME}.resource")
 
 
 def ensure_runtime_path() -> None:
@@ -205,6 +216,13 @@ def setup_logging() -> None:
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
     root.addHandler(stream_handler)
+
+    RESOURCE_LOGGER.setLevel(logging.INFO)
+    RESOURCE_LOGGER.handlers.clear()
+    RESOURCE_LOGGER.propagate = False
+    resource_handler = logging.FileHandler(RESOURCE_LOG_FILE, encoding="utf-8")
+    resource_handler.setFormatter(formatter)
+    RESOURCE_LOGGER.addHandler(resource_handler)
 
 
 def write_pid_file() -> None:
@@ -265,6 +283,101 @@ class NoSpeechDetectedError(RuntimeError):
     pass
 
 
+@dataclass
+class ProcessResourceSnapshot:
+    rss_kb: int
+    vsz_kb: int
+    cpu_percent: float
+    mem_percent: float
+    thread_count: int
+    captured_at: float = field(default_factory=time.time)
+
+
+def capture_process_resource_snapshot(pid: int | None = None) -> ProcessResourceSnapshot | None:
+    target_pid = pid or os.getpid()
+    try:
+        result = subprocess.run(
+            [
+                "ps",
+                "-o",
+                "rss=",
+                "-o",
+                "vsz=",
+                "-o",
+                "%cpu=",
+                "-o",
+                "%mem=",
+                "-p",
+                str(target_pid),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+    except Exception:
+        LOGGER.exception("Failed to capture process resources for PID %s", target_pid)
+        return None
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    parts = lines[0].split()
+    if len(parts) < 4:
+        LOGGER.warning("Unexpected ps output while capturing resources: %r", lines[0])
+        return None
+
+    try:
+        return ProcessResourceSnapshot(
+            rss_kb=int(parts[0]),
+            vsz_kb=int(parts[1]),
+            cpu_percent=float(parts[2]),
+            mem_percent=float(parts[3]),
+            thread_count=threading.active_count(),
+        )
+    except ValueError:
+        LOGGER.warning("Failed to parse resource snapshot fields: %r", parts)
+        return None
+
+
+def format_resource_snapshot(snapshot: ProcessResourceSnapshot) -> str:
+    return (
+        f"rss_mb={snapshot.rss_kb / 1024:.1f} "
+        f"vsz_gb={snapshot.vsz_kb / 1024 / 1024:.2f} "
+        f"cpu_pct={snapshot.cpu_percent:.1f} "
+        f"mem_pct={snapshot.mem_percent:.1f} "
+        f"threads={snapshot.thread_count}"
+    )
+
+
+def log_resource_checkpoint(label: str, **fields: object) -> None:
+    snapshot = capture_process_resource_snapshot()
+    if snapshot is None:
+        RESOURCE_LOGGER.info("checkpoint label=%s snapshot=unavailable", label)
+        return
+
+    extra_parts = [
+        f"{key}={value}"
+        for key, value in fields.items()
+        if value is not None and value != ""
+    ]
+    extra = " ".join(extra_parts)
+    if extra:
+        RESOURCE_LOGGER.info(
+            "checkpoint label=%s %s %s",
+            label,
+            extra,
+            format_resource_snapshot(snapshot),
+        )
+    else:
+        RESOURCE_LOGGER.info(
+            "checkpoint label=%s %s",
+            label,
+            format_resource_snapshot(snapshot),
+        )
+
+
 def float_audio_to_pcm16(audio: np.ndarray) -> np.ndarray:
     clipped = np.clip(audio, -1.0, 1.0)
     return np.round(clipped * 32767.0).astype(np.int16)
@@ -304,9 +417,16 @@ def is_effectively_silent_metrics(peak: float, rms: float, active_ratio: float) 
         active_ratio,
     )
     return (
-        peak < SILENCE_PEAK_THRESHOLD
-        and rms < SILENCE_RMS_THRESHOLD
-        and active_ratio < SILENCE_ACTIVE_RATIO_THRESHOLD
+        (
+            peak < SILENCE_PEAK_THRESHOLD
+            and rms < SILENCE_RMS_THRESHOLD
+            and active_ratio < SILENCE_ACTIVE_RATIO_THRESHOLD
+        )
+        or (
+            peak < SILENCE_CLICKY_PEAK_THRESHOLD
+            and rms < SILENCE_CLICKY_RMS_THRESHOLD
+            and active_ratio < SILENCE_CLICKY_ACTIVE_RATIO_THRESHOLD
+        )
     )
 
 
@@ -454,6 +574,11 @@ def is_filtered_hallucination(text: str) -> bool:
     return False
 
 
+def is_punctuation_only_transcript(text: str) -> bool:
+    collapsed = re.sub(r"[、。！？,.!?:;：；\s]+", "", text)
+    return not collapsed
+
+
 @dataclass
 class RecordingResult:
     duration_seconds: float
@@ -475,6 +600,187 @@ class TranscriptionJob:
     source_path: Path | None = field(compare=False, default=None)
     archive_path: Path | None = field(compare=False, default=None)
     output_inbox: Path | None = field(compare=False, default=None)
+
+
+class ResourceMonitor:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._wake_event = threading.Event()
+        self._job_kind: str | None = None
+        self._job_stamp: str | None = None
+        self._job_source: str | None = None
+        self._job_start_snapshot: ProcessResourceSnapshot | None = None
+        self._peak_rss_kb = 0
+        self._peak_cpu_percent = 0.0
+        self._rss_floor_kb: int | None = None
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="resource-monitor",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def begin_job(self, *, kind: str, stamp: str, source: str) -> None:
+        snapshot = capture_process_resource_snapshot()
+        with self._lock:
+            self._job_kind = kind
+            self._job_stamp = stamp
+            self._job_source = source
+            self._job_start_snapshot = snapshot
+            self._peak_rss_kb = snapshot.rss_kb if snapshot is not None else 0
+            self._peak_cpu_percent = snapshot.cpu_percent if snapshot is not None else 0.0
+
+        if snapshot is None:
+            RESOURCE_LOGGER.info(
+                "job-start kind=%s stamp=%s source=%s snapshot=unavailable",
+                kind,
+                stamp,
+                source,
+            )
+        else:
+            RESOURCE_LOGGER.info(
+                "job-start kind=%s stamp=%s source=%s %s",
+                kind,
+                stamp,
+                source,
+                format_resource_snapshot(snapshot),
+            )
+        self._wake_event.set()
+
+    def end_job(self, *, status: str) -> None:
+        snapshot = capture_process_resource_snapshot()
+        with self._lock:
+            kind = self._job_kind
+            stamp = self._job_stamp
+            source = self._job_source
+            start_snapshot = self._job_start_snapshot
+            peak_rss_kb = max(
+                self._peak_rss_kb,
+                snapshot.rss_kb if snapshot is not None else 0,
+            )
+            peak_cpu_percent = max(
+                self._peak_cpu_percent,
+                snapshot.cpu_percent if snapshot is not None else 0.0,
+            )
+            self._job_kind = None
+            self._job_stamp = None
+            self._job_source = None
+            self._job_start_snapshot = None
+            if snapshot is not None:
+                if self._rss_floor_kb is None:
+                    self._rss_floor_kb = snapshot.rss_kb
+                else:
+                    self._rss_floor_kb = min(self._rss_floor_kb, snapshot.rss_kb)
+            rss_floor_kb = self._rss_floor_kb
+
+        if kind is None or stamp is None or source is None:
+            return
+
+        if snapshot is None:
+            RESOURCE_LOGGER.info(
+                "job-end kind=%s stamp=%s source=%s status=%s snapshot=unavailable",
+                kind,
+                stamp,
+                source,
+                status,
+            )
+            return
+
+        start_rss_kb = start_snapshot.rss_kb if start_snapshot is not None else snapshot.rss_kb
+        delta_rss_mb = (snapshot.rss_kb - start_rss_kb) / 1024
+        rss_above_floor_mb = (
+            (snapshot.rss_kb - rss_floor_kb) / 1024
+            if rss_floor_kb is not None
+            else 0.0
+        )
+        RESOURCE_LOGGER.info(
+            "job-end kind=%s stamp=%s source=%s status=%s start_rss_mb=%.1f end_rss_mb=%.1f delta_rss_mb=%+.1f peak_rss_mb=%.1f peak_cpu_pct=%.1f end_cpu_pct=%.1f rss_above_floor_mb=%.1f mem_pct=%.1f threads=%d",
+            kind,
+            stamp,
+            source,
+            status,
+            start_rss_kb / 1024,
+            snapshot.rss_kb / 1024,
+            delta_rss_mb,
+            peak_rss_kb / 1024,
+            peak_cpu_percent,
+            snapshot.cpu_percent,
+            rss_above_floor_mb,
+            snapshot.mem_percent,
+            snapshot.thread_count,
+        )
+        self._schedule_idle_snapshot(kind=kind, stamp=stamp, source=source, status=status)
+
+    def _schedule_idle_snapshot(self, *, kind: str, stamp: str, source: str, status: str) -> None:
+        def worker() -> None:
+            time.sleep(RESOURCE_IDLE_SNAPSHOT_DELAY_SECONDS)
+            with self._lock:
+                if self._job_kind is not None:
+                    return
+            snapshot = capture_process_resource_snapshot()
+            if snapshot is None:
+                return
+            with self._lock:
+                if self._rss_floor_kb is None:
+                    self._rss_floor_kb = snapshot.rss_kb
+                else:
+                    self._rss_floor_kb = min(self._rss_floor_kb, snapshot.rss_kb)
+                rss_floor_kb = self._rss_floor_kb
+            rss_above_floor_mb = (
+                (snapshot.rss_kb - rss_floor_kb) / 1024
+                if rss_floor_kb is not None
+                else 0.0
+            )
+            RESOURCE_LOGGER.info(
+                "idle-check kind=%s stamp=%s source=%s status=%s rss_above_floor_mb=%.1f %s",
+                kind,
+                stamp,
+                source,
+                status,
+                rss_above_floor_mb,
+                format_resource_snapshot(snapshot),
+            )
+
+        threading.Thread(
+            target=worker,
+            name="resource-idle-check",
+            daemon=True,
+        ).start()
+
+    def _loop(self) -> None:
+        while True:
+            with self._lock:
+                kind = self._job_kind
+                stamp = self._job_stamp
+                source = self._job_source
+
+            if kind is None or stamp is None or source is None:
+                self._wake_event.wait(timeout=0.5)
+                self._wake_event.clear()
+                continue
+
+            snapshot = capture_process_resource_snapshot()
+            if snapshot is not None:
+                with self._lock:
+                    if self._job_kind != kind or self._job_stamp != stamp:
+                        continue
+                    self._peak_rss_kb = max(self._peak_rss_kb, snapshot.rss_kb)
+                    self._peak_cpu_percent = max(
+                        self._peak_cpu_percent,
+                        snapshot.cpu_percent,
+                    )
+                RESOURCE_LOGGER.info(
+                    "sample kind=%s stamp=%s source=%s %s",
+                    kind,
+                    stamp,
+                    source,
+                    format_resource_snapshot(snapshot),
+                )
+
+            time.sleep(RESOURCE_LOG_INTERVAL_SECONDS)
 
 
 class RollingAudioWriter:
@@ -775,6 +1081,11 @@ class Transcriber:
                 "Warmup finished with mlx-whisper model '%s'",
                 self.mlx_model_name,
             )
+            log_resource_checkpoint(
+                "warmup-finished",
+                backend="mlx-whisper",
+                model=self.mlx_model_name,
+            )
         except Exception:
             LOGGER.exception("Warmup failed for mlx-whisper; faster-whisper fallback will remain")
             try:
@@ -782,6 +1093,11 @@ class Transcriber:
                 LOGGER.info(
                     "Warmup finished with faster-whisper model '%s'",
                     self.faster_model_name,
+                )
+                log_resource_checkpoint(
+                    "warmup-finished",
+                    backend="faster-whisper",
+                    model=self.faster_model_name,
                 )
             except Exception:
                 LOGGER.exception("Warmup failed for faster-whisper fallback")
@@ -902,6 +1218,13 @@ class Transcriber:
                     )
                     if normalized_text != text:
                         LOGGER.info("Normalized transcript output for %s", language)
+                    if is_punctuation_only_transcript(normalized_text):
+                        LOGGER.warning(
+                            "Dropped punctuation-only transcript from %s: %r",
+                            backend_name,
+                            normalized_text,
+                        )
+                        raise NoSpeechDetectedError("No speech was detected in the recording.")
                     if is_filtered_hallucination(normalized_text):
                         errors.append(f"{backend_name}: hallucination filter")
                         LOGGER.warning(
@@ -1124,6 +1447,7 @@ def run_self_check() -> int:
         "app_dir": str(APP_DIR),
         "transcripts_dir": str(TRANSCRIPTS_DIR),
         "log_file": str(LOG_FILE),
+        "resource_log_file": str(RESOURCE_LOG_FILE),
         "shortcut_trusted": None,
         "default_device": None,
         "devices": [],
@@ -1255,6 +1579,7 @@ class VoiceDropApp(rumps.App):
         super().__init__(APP_NAME, title="VD", quit_button="Quit VoiceDrop")
         self.recorder = AudioRecorder()
         self.transcriber = Transcriber()
+        self.resource_monitor = ResourceMonitor()
         self._job_queue: queue.PriorityQueue[TranscriptionJob] = queue.PriorityQueue()
         self._job_counter = itertools.count()
         self._job_state_lock = threading.Lock()
@@ -1358,7 +1683,9 @@ class VoiceDropApp(rumps.App):
         self._recover_pending_imports()
         self._import_watch_thread.start()
         self.transcriber.start_warmup()
+        self.resource_monitor.start()
         self._spinner_thread.start()
+        log_resource_checkpoint("app-ready")
         send_notification("Ready", "VoiceDrop is running in the menu bar.")
 
     def _set_title(self, value: str) -> None:
@@ -1771,6 +2098,12 @@ class VoiceDropApp(rumps.App):
     def _process_live_job(self, job: TranscriptionJob) -> None:
         audio_path = job.audio_path
         archive_path = job.archive_path or audio_path
+        status = "unknown"
+        self.resource_monitor.begin_job(
+            kind="live",
+            stamp=job.stamp,
+            source=audio_path.name,
+        )
         try:
             text, language, backend, segments = self.transcriber.transcribe(audio_path)
             if not text:
@@ -1810,13 +2143,17 @@ class VoiceDropApp(rumps.App):
                     "Transcript saved",
                     f"{transcript_path.name} ({language}, {backend}) | audio: {final_archive_path.name} | paste failed: {paste_error}",
                 )
+            status = f"ok:{backend}:{language}"
         except NoSpeechDetectedError as exc:
             LOGGER.info("Recording discarded after transcription: %s", exc)
             send_notification("Discarded", str(exc))
+            status = "discarded:no-speech"
         except Exception as exc:
             LOGGER.exception("Transcription failed")
             send_notification("Transcription failed", str(exc))
+            status = f"error:{type(exc).__name__}"
         finally:
+            self.resource_monitor.end_job(status=status)
             try:
                 if audio_path.exists():
                     audio_path.unlink()
@@ -1832,6 +2169,12 @@ class VoiceDropApp(rumps.App):
         )
         output_dir: Path | None = None
         wav_path: Path | None = None
+        status = "unknown"
+        self.resource_monitor.begin_job(
+            kind="import",
+            stamp=job.stamp,
+            source=source_path.name,
+        )
         try:
             transcribe_path = source_path
             if source_path.suffix.lower() not in {".wav", ".mp3"}:
@@ -1888,10 +2231,12 @@ class VoiceDropApp(rumps.App):
                     "Imported transcript saved",
                     f"{output_dir.name} ({language}, {backend})",
                 )
+            status = f"ok:{backend}:{language}"
         except NoSpeechDetectedError as exc:
             failed_dir = move_failed_import(source_path, job.stamp, str(exc))
             LOGGER.info("Imported audio discarded: %s", failed_dir)
             send_notification("Imported file discarded", failed_dir.name)
+            status = "discarded:no-speech"
         except Exception as exc:
             if output_dir is not None and output_dir.exists() and not source_path.exists():
                 (output_dir / "error.txt").write_text(str(exc) + "\n", encoding="utf-8")
@@ -1900,7 +2245,9 @@ class VoiceDropApp(rumps.App):
                 failed_dir = move_failed_import(source_path, job.stamp, str(exc))
             LOGGER.exception("Imported transcription failed")
             send_notification("Import failed", failed_dir.name)
+            status = f"error:{type(exc).__name__}"
         finally:
+            self.resource_monitor.end_job(status=status)
             if wav_path is not None and wav_path.exists():
                 wav_path.unlink(missing_ok=True)
 
