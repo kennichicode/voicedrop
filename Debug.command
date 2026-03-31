@@ -38,6 +38,7 @@ echo ""
 echo "📋 起動ログ (最新10行):"
 LOG="$HOME/Library/Logs/VoiceDrop/voicedrop.log"
 LAUNCHER_LOG="$HOME/Library/Logs/VoiceDrop/launcher.log"
+RESOURCE_LOG="$HOME/Library/Logs/VoiceDrop/resource.log"
 if [ -f "$LAUNCHER_LOG" ]; then
   echo "--- launcher.log ---"
   tail -10 "$LAUNCHER_LOG"
@@ -47,6 +48,25 @@ if [ -f "$LOG" ]; then
   tail -10 "$LOG"
 else
   echo "  (ログファイルなし)"
+fi
+if [ -f "$RESOURCE_LOG" ]; then
+  echo "--- resource.log ---"
+  tail -12 "$RESOURCE_LOG"
+fi
+
+# --- 現在の使用量 ---
+echo ""
+echo "📈 現在の使用量:"
+PID_FILE="$HOME/Library/Application Support/VoiceDrop/voicedrop.pid"
+if [ -f "$PID_FILE" ]; then
+  PID="$(tr -d '[:space:]' < "$PID_FILE")"
+  if kill -0 "$PID" 2>/dev/null; then
+    ps -o pid=,etime=,%cpu=,%mem=,rss=,vsz=,command= -p "$PID"
+  else
+    echo "  (PIDファイルはあるがプロセスは停止中)"
+  fi
+else
+  echo "  (VoiceDropは未起動)"
 fi
 
 # --- 直接起動テスト ---

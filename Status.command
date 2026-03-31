@@ -4,6 +4,7 @@ cd "$(dirname "$0")"
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 PID_FILE="$HOME/Library/Application Support/VoiceDrop/voicedrop.pid"
 LOG_FILE="$HOME/Library/Logs/VoiceDrop/voicedrop.log"
+RESOURCE_LOG_FILE="$HOME/Library/Logs/VoiceDrop/resource.log"
 AGENT_LABEL="com.voicedrop.agent"
 GUI_DOMAIN="gui/$(id -u)"
 
@@ -18,6 +19,8 @@ if [ -f "$PID_FILE" ]; then
   PID="$(tr -d '[:space:]' < "$PID_FILE")"
   if kill -0 "$PID" 2>/dev/null; then
     echo "✅ 実行中 (PID: $PID)"
+    echo "   使用量:"
+    ps -o pid=,etime=,%cpu=,%mem=,rss=,vsz=,command= -p "$PID"
   else
     echo "❌ 停止中 (PIDファイルあり・プロセスなし)"
   fi
@@ -46,6 +49,14 @@ if [ -f "$LOG_FILE" ]; then
   tail -5 "$LOG_FILE"
 else
   echo "  (ログなし)"
+fi
+
+echo ""
+echo "📈 リソースログ:"
+if [ -f "$RESOURCE_LOG_FILE" ]; then
+  tail -8 "$RESOURCE_LOG_FILE"
+else
+  echo "  (resource.log なし)"
 fi
 
 echo ""
