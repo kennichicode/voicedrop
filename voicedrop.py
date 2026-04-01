@@ -91,6 +91,9 @@ IMPORT_STABILITY_SECONDS = 2.0
 STOP_OPERATION_TIMEOUT_SECONDS = float(
     os.getenv("VOICEDROP_STOP_TIMEOUT_SECONDS", "5.0")
 )
+STREAM_CLOSE_TIMEOUT_SECONDS = float(
+    os.getenv("VOICEDROP_STREAM_CLOSE_TIMEOUT_SECONDS", "2.5")
+)
 RESOURCE_LOG_INTERVAL_SECONDS = float(
     os.getenv("VOICEDROP_RESOURCE_LOG_INTERVAL_SECONDS", "1.0")
 )
@@ -291,6 +294,55 @@ class ProcessResourceSnapshot:
     mem_percent: float
     thread_count: int
     captured_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class BackgroundCallResult:
+    completed: bool
+    elapsed_seconds: float
+    error: Exception | None = None
+
+
+def run_background_call_with_timeout(
+    label: str,
+    func,
+    *,
+    timeout_seconds: float,
+) -> BackgroundCallResult:
+    holder: dict[str, Exception] = {}
+
+    def worker() -> None:
+        try:
+            func()
+        except Exception as exc:
+            holder["error"] = exc
+
+    LOGGER.info("%s started", label)
+    started_at = time.monotonic()
+    thread = threading.Thread(
+        target=worker,
+        name=f"timed-call-{label.lower().replace(' ', '-')}",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+    elapsed_seconds = time.monotonic() - started_at
+
+    if thread.is_alive():
+        LOGGER.warning("%s timed out after %.2f seconds", label, elapsed_seconds)
+        return BackgroundCallResult(completed=False, elapsed_seconds=elapsed_seconds)
+
+    error = holder.get("error")
+    if error is not None:
+        LOGGER.warning("%s failed after %.2f seconds: %s", label, elapsed_seconds, error)
+        return BackgroundCallResult(
+            completed=True,
+            elapsed_seconds=elapsed_seconds,
+            error=error,
+        )
+
+    LOGGER.info("%s finished in %.2f seconds", label, elapsed_seconds)
+    return BackgroundCallResult(completed=True, elapsed_seconds=elapsed_seconds)
 
 
 def capture_process_resource_snapshot(pid: int | None = None) -> ProcessResourceSnapshot | None:
@@ -941,6 +993,7 @@ class AudioRecorder:
         self._started_at: float | None = None
         self._started_stamp: str | None = None
         self._writer: RollingAudioWriter | None = None
+        self._capture_active = False
         self._peak = 0.0
         self._sum_squares = 0.0
         self._active_samples = 0
@@ -964,6 +1017,8 @@ class AudioRecorder:
         active_samples = int(np.count_nonzero(abs_audio >= SILENCE_PEAK_THRESHOLD))
 
         with self._lock:
+            if not self._capture_active:
+                return
             self._peak = max(self._peak, peak)
             self._sum_squares += sum_squares
             self._active_samples += active_samples
@@ -979,10 +1034,12 @@ class AudioRecorder:
         self._started_stamp = utc_timestamp()
         self._writer = RollingAudioWriter(self._started_stamp)
         self._writer.start()
-        self._peak = 0.0
-        self._sum_squares = 0.0
-        self._active_samples = 0
-        self._total_samples = 0
+        with self._lock:
+            self._capture_active = True
+            self._peak = 0.0
+            self._sum_squares = 0.0
+            self._active_samples = 0
+            self._total_samples = 0
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
@@ -1007,36 +1064,52 @@ class AudioRecorder:
         self._stream = None
         writer = self._writer
         self._writer = None
-        # stream.stop() can deadlock in PortAudio when called shortly after start.
-        # Run it in a daemon thread with a timeout so the stop never hangs forever.
-        _stop_thread = threading.Thread(target=stream.stop, daemon=True)
-        _stop_thread.start()
-        _stop_thread.join(timeout=3.0)
-        try:
-            stream.close()
-        except Exception:
-            pass
-
-        duration_seconds = time.time() - self._started_at
+        started_at = self._started_at
         self._started_at = None
         started_stamp = self._started_stamp
         self._started_stamp = None
+
+        with self._lock:
+            self._capture_active = False
+
+        close_result = run_background_call_with_timeout(
+            "Audio stream close",
+            stream.close,
+            timeout_seconds=STREAM_CLOSE_TIMEOUT_SECONDS,
+        )
+        if close_result.error is not None:
+            LOGGER.warning(
+                "Audio stream close raised an exception; continuing with buffered audio"
+            )
+
+        writer_started_at = time.monotonic()
+        LOGGER.info("Audio writer stop started")
         segment_paths = writer.stop()
+        LOGGER.info(
+            "Audio writer stop finished in %.2f seconds",
+            time.monotonic() - writer_started_at,
+        )
 
         with self._lock:
             peak = self._peak
             total_samples = self._total_samples
             active_samples = self._active_samples
             sum_squares = self._sum_squares
+            self._capture_active = False
             self._peak = 0.0
             self._sum_squares = 0.0
             self._active_samples = 0
             self._total_samples = 0
 
+        duration_seconds = time.time() - started_at
         rms = float(np.sqrt(sum_squares / total_samples)) if total_samples else 0.0
         active_ratio = float(active_samples / total_samples) if total_samples else 0.0
 
-        LOGGER.info("Recording stopped after %.2f seconds", duration_seconds)
+        LOGGER.info(
+            "Recording stopped after %.2f seconds (stream_close_completed=%s)",
+            duration_seconds,
+            close_result.completed,
+        )
         return RecordingResult(
             duration_seconds=duration_seconds,
             started_stamp=started_stamp,
@@ -2404,7 +2477,7 @@ class VoiceDropApp(rumps.App):
             LOGGER.info("Ignoring stop request via %s during transition", source)
             return
         self._cancel_recording_timeout()
-        self._set_title("STP")
+        self._set_title("...")
         self._refresh_menu_state()
         threading.Thread(
             target=self._stop_recording_worker,
