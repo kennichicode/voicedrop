@@ -91,6 +91,12 @@ IMPORT_STABILITY_SECONDS = 2.0
 STOP_OPERATION_TIMEOUT_SECONDS = float(
     os.getenv("VOICEDROP_STOP_TIMEOUT_SECONDS", "5.0")
 )
+START_OPERATION_TIMEOUT_SECONDS = float(
+    os.getenv("VOICEDROP_START_TIMEOUT_SECONDS", "5.0")
+)
+STREAM_ABORT_TIMEOUT_SECONDS = float(
+    os.getenv("VOICEDROP_STREAM_ABORT_TIMEOUT_SECONDS", "1.0")
+)
 STREAM_CLOSE_TIMEOUT_SECONDS = float(
     os.getenv("VOICEDROP_STREAM_CLOSE_TIMEOUT_SECONDS", "2.5")
 )
@@ -640,6 +646,9 @@ class RecordingResult:
     peak: float
     rms: float
     active_ratio: float
+    stream_abort_completed: bool = True
+    stream_close_completed: bool = True
+    backend_reset_required: bool = False
 
 
 @dataclass(order=True)
@@ -994,6 +1003,7 @@ class AudioRecorder:
         self._started_stamp: str | None = None
         self._writer: RollingAudioWriter | None = None
         self._capture_active = False
+        self._backend_needs_reset = False
         self._peak = 0.0
         self._sum_squares = 0.0
         self._active_samples = 0
@@ -1006,6 +1016,27 @@ class AudioRecorder:
     @property
     def recording_stamp(self) -> str | None:
         return self._started_stamp
+
+    @property
+    def backend_needs_reset(self) -> bool:
+        return self._backend_needs_reset
+
+    def _discard_failed_start_session(self, writer: RollingAudioWriter | None) -> None:
+        if writer is None:
+            return
+        try:
+            writer.stop()
+        except Exception:
+            LOGGER.exception("Failed to stop writer after recording start failure")
+        try:
+            shutil.rmtree(writer.session_dir)
+        except FileNotFoundError:
+            return
+        except Exception:
+            LOGGER.exception(
+                "Failed to remove in-progress session after recording start failure: %s",
+                writer.session_dir,
+            )
 
     def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         if status:
@@ -1031,23 +1062,56 @@ class AudioRecorder:
     def start(self) -> None:
         if self._stream is not None:
             raise RuntimeError("Recording already in progress")
-        self._started_stamp = utc_timestamp()
-        self._writer = RollingAudioWriter(self._started_stamp)
-        self._writer.start()
+        if self._backend_needs_reset:
+            raise RuntimeError(
+                "Audio backend is recovering from a previous timeout. VoiceDrop will relaunch automatically."
+            )
+
+        started_stamp = utc_timestamp()
+        writer: RollingAudioWriter | None = None
+        stream: sd.InputStream | None = None
+
+        try:
+            stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                callback=self._callback,
+                blocksize=0,
+            )
+            writer = RollingAudioWriter(started_stamp)
+            writer.start()
+        except Exception:
+            self._discard_failed_start_session(writer)
+            raise
+
         with self._lock:
+            self._started_stamp = started_stamp
+            self._writer = writer
             self._capture_active = True
             self._peak = 0.0
             self._sum_squares = 0.0
             self._active_samples = 0
             self._total_samples = 0
-        self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            callback=self._callback,
-            blocksize=0,
-        )
-        self._stream.start()
+        try:
+            stream.start()
+        except Exception:
+            with self._lock:
+                self._started_stamp = None
+                self._writer = None
+                self._capture_active = False
+                self._peak = 0.0
+                self._sum_squares = 0.0
+                self._active_samples = 0
+                self._total_samples = 0
+            try:
+                stream.close()
+            except Exception:
+                LOGGER.exception("Failed to close stream after recording start failure")
+            self._discard_failed_start_session(writer)
+            raise
+
+        self._stream = stream
         self._started_at = time.time()
         LOGGER.info("Recording started")
 
@@ -1072,6 +1136,16 @@ class AudioRecorder:
         with self._lock:
             self._capture_active = False
 
+        abort_result = run_background_call_with_timeout(
+            "Audio stream abort",
+            stream.abort,
+            timeout_seconds=STREAM_ABORT_TIMEOUT_SECONDS,
+        )
+        if abort_result.error is not None:
+            LOGGER.warning(
+                "Audio stream abort raised an exception; backend will be reset"
+            )
+
         close_result = run_background_call_with_timeout(
             "Audio stream close",
             stream.close,
@@ -1081,6 +1155,13 @@ class AudioRecorder:
             LOGGER.warning(
                 "Audio stream close raised an exception; continuing with buffered audio"
             )
+        backend_reset_required = (
+            not abort_result.completed
+            or abort_result.error is not None
+            or not close_result.completed
+            or close_result.error is not None
+        )
+        self._backend_needs_reset = backend_reset_required
 
         writer_started_at = time.monotonic()
         LOGGER.info("Audio writer stop started")
@@ -1106,9 +1187,11 @@ class AudioRecorder:
         active_ratio = float(active_samples / total_samples) if total_samples else 0.0
 
         LOGGER.info(
-            "Recording stopped after %.2f seconds (stream_close_completed=%s)",
+            "Recording stopped after %.2f seconds (stream_abort_completed=%s stream_close_completed=%s backend_reset_required=%s)",
             duration_seconds,
+            abort_result.completed,
             close_result.completed,
+            backend_reset_required,
         )
         return RecordingResult(
             duration_seconds=duration_seconds,
@@ -1118,6 +1201,9 @@ class AudioRecorder:
             peak=peak,
             rms=rms,
             active_ratio=active_ratio,
+            stream_abort_completed=abort_result.completed,
+            stream_close_completed=close_result.completed,
+            backend_reset_required=backend_reset_required,
         )
 
 
@@ -1666,6 +1752,8 @@ class VoiceDropApp(rumps.App):
         self._recording_timer_lock = threading.Lock()
         self._recording_timer_cancel: threading.Event | None = None
         self._recording_timer_stamp: str | None = None
+        self._restart_request_lock = threading.Lock()
+        self._restart_requested = False
         self.shortcut_monitor = RightOptionEventTap(self.toggle_recording_from_shortcut)
         self._spinner_thread = threading.Thread(
             target=self._spinner_loop,
@@ -2347,6 +2435,63 @@ class VoiceDropApp(rumps.App):
             daemon=True,
         ).start()
 
+    def _start_start_watchdog(self, completed: threading.Event) -> None:
+        def watch() -> None:
+            if completed.wait(START_OPERATION_TIMEOUT_SECONDS):
+                return
+            LOGGER.error(
+                "Recording start exceeded %.1f seconds; scheduling restart",
+                START_OPERATION_TIMEOUT_SECONDS,
+            )
+            AppHelper.callAfter(
+                self._fail_start_recording,
+                "Microphone start got stuck. VoiceDrop will relaunch automatically.",
+            )
+            self._request_restart_when_idle(
+                "recording-start-timeout",
+                "Microphone start got stuck. VoiceDrop will relaunch automatically.",
+            )
+
+        threading.Thread(
+            target=watch,
+            name="start-watchdog",
+            daemon=True,
+        ).start()
+
+    def _request_restart_when_idle(self, reason: str, message: str) -> None:
+        with self._restart_request_lock:
+            if self._restart_requested:
+                LOGGER.info(
+                    "VoiceDrop restart already scheduled; ignoring duplicate reason=%s",
+                    reason,
+                )
+                return
+            self._restart_requested = True
+
+        LOGGER.warning("Scheduled VoiceDrop restart when idle: %s", reason)
+
+        def watch() -> None:
+            while True:
+                if (
+                    not self.recorder.is_recording
+                    and self._recording_transition_state() is None
+                    and not self._has_pending_work()
+                ):
+                    LOGGER.error("Restarting VoiceDrop because %s", reason)
+                    try:
+                        send_notification("VoiceDrop restarting", message)
+                    except Exception:
+                        LOGGER.exception("Failed to send scheduled restart notification")
+                    time.sleep(0.2)
+                    os._exit(75)
+                time.sleep(0.25)
+
+        threading.Thread(
+            target=watch,
+            name="restart-when-idle",
+            daemon=True,
+        ).start()
+
     def _finish_start_recording(self) -> None:
         self._arm_recording_timeout()
         self._clear_recording_transition()
@@ -2381,8 +2526,11 @@ class VoiceDropApp(rumps.App):
         send_notification(title, message)
 
     def _start_recording_worker(self, source: str) -> None:
+        completed = threading.Event()
+        self._start_start_watchdog(completed)
         if self.recorder.is_recording:
             LOGGER.info("Ignoring start request via %s because recording is already active", source)
+            completed.set()
             AppHelper.callAfter(
                 self._fail_start_recording,
                 "VoiceDrop is already recording.",
@@ -2393,15 +2541,23 @@ class VoiceDropApp(rumps.App):
             self.recorder.start()
         except Exception as exc:
             LOGGER.exception("Failed to start recording")
+            completed.set()
             AppHelper.callAfter(self._fail_start_recording, str(exc))
+            if self.recorder.backend_needs_reset:
+                self._request_restart_when_idle(
+                    "audio-backend-reset-before-start",
+                    "Audio backend is recovering from a previous timeout. VoiceDrop will relaunch automatically.",
+                )
             return
 
+        completed.set()
         LOGGER.info("Recording started via %s", source)
         AppHelper.callAfter(self._finish_start_recording)
 
     def _stop_recording_worker(self, source: str) -> None:
         completed = threading.Event()
         self._start_stop_watchdog(completed)
+        restart_message: str | None = None
         if not self.recorder.is_recording:
             LOGGER.info("Ignoring stop request via %s because recording is not active", source)
             completed.set()
@@ -2419,12 +2575,22 @@ class VoiceDropApp(rumps.App):
             completed.set()
             AppHelper.callAfter(self._fail_stop_recording, "Stop failed", str(exc))
             return
+        if result.backend_reset_required:
+            restart_message = (
+                "Audio backend got stuck while closing the microphone stream. "
+                "VoiceDrop will relaunch automatically."
+            )
 
         if result.duration_seconds < MIN_RECORDING_SECONDS or not result.segment_paths:
             LOGGER.info("Short recording discarded via %s", source)
             cleanup_recording_session(result)
             completed.set()
             AppHelper.callAfter(self._discard_stop_recording, "Recording was too short.")
+            if restart_message is not None:
+                self._request_restart_when_idle(
+                    "audio-stream-reset-after-short-recording",
+                    restart_message,
+                )
             return
 
         if is_effectively_silent_metrics(result.peak, result.rms, result.active_ratio):
@@ -2432,6 +2598,11 @@ class VoiceDropApp(rumps.App):
             cleanup_recording_session(result)
             completed.set()
             AppHelper.callAfter(self._discard_stop_recording, "No speech was detected.")
+            if restart_message is not None:
+                self._request_restart_when_idle(
+                    "audio-stream-reset-after-silent-recording",
+                    restart_message,
+                )
             return
 
         try:
@@ -2440,12 +2611,22 @@ class VoiceDropApp(rumps.App):
             LOGGER.exception("Failed to save recording")
             completed.set()
             AppHelper.callAfter(self._fail_stop_recording, "Save failed", str(exc))
+            if restart_message is not None:
+                self._request_restart_when_idle(
+                    "audio-stream-reset-after-save-failure",
+                    restart_message,
+                )
             return
 
         LOGGER.info("Recording stopped via %s; queueing transcription", source)
         self._enqueue_live_job(audio_path, archive_path, result.started_stamp)
         completed.set()
         AppHelper.callAfter(self._finish_stop_recording)
+        if restart_message is not None:
+            self._request_restart_when_idle(
+                "audio-stream-reset-after-stop-timeout",
+                restart_message,
+            )
 
     def _request_start_recording(self, source: str) -> None:
         if self.recorder.is_recording:
