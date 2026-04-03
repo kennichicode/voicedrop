@@ -71,25 +71,6 @@ A Terminal window flashes briefly, then a 🎙️ icon appears in your menu bar.
 
 The menu bar icon changes while recording. Open any text field and press Cmd+V to paste.
 
-### Transcribe an audio file
-
-Drop an audio file into this folder:
-
-```
-Desktop/VoiceDrop Transcripts/Import/Inbox/
-```
-
-Supported formats: `.mp3` `.wav` `.m4a` `.aac` `.flac` `.ogg`
-
-Output is saved to:
-
-```
-Desktop/VoiceDrop Transcripts/Import/Processed/(date)/
-  ├── transcript.txt
-  ├── audio.mp3
-  └── meta.json
-```
-
 ---
 
 ## Accessibility permission (first launch only)
@@ -108,8 +89,11 @@ VoiceDrop needs Accessibility access to detect the Right Option key shortcut.
 |---|---|
 | Start Recording | Start recording |
 | Stop Recording | Stop recording |
-| Open Transcripts Folder | Open the transcripts folder |
+| Shortcut: Right Option (toggle) | Shows shortcut status |
+| Open Transcripts Folder | Open the saved transcripts folder |
+| Copy Last Transcript | Copy the last transcript to clipboard |
 | Model | Switch Whisper model (see below) |
+| Self Check | Print diagnostics to Terminal |
 | Quit | Quit VoiceDrop |
 
 ### Switching models
@@ -149,9 +133,13 @@ Switching models restarts VoiceDrop automatically. Both models are never loaded 
 
 ## Changelog
 
+### v2.0.0 (2026-04-03)
+- **Live recording only**: Simplified to focus on the core use case — speak, transcribe, paste
+- Removed Import Inbox and Obsidian integration (available in VoiceDrop Private)
+
 ### v1.1.0 (2026-03-31)
-- **Reduced memory usage**: Default model switched from `whisper-large-v3-turbo` (~1.5GB) to `whisper-small-mlx` (~300MB) — roughly 1/4 the memory footprint
-- **Model switcher**: Switch between Small and Large v3 Turbo from the menu bar. Switching restarts the process so memory is fully released
+- **Reduced memory usage**: Default model switched from `whisper-large-v3-turbo` (~1.5GB) to `whisper-small-mlx` (~300MB)
+- **Model switcher**: Switch between Small and Large v3 Turbo from the menu bar
 
 ### v1.0.0
 - Initial release
