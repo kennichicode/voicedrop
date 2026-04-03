@@ -1,6 +1,6 @@
 # VoiceDrop Private
 
-A macOS menu bar app that transcribes your speech and copies it to the clipboard instantly.
+A macOS menu bar app for speech transcription — optimized for personal workflows with Obsidian.
 All processing happens locally using Whisper AI — **your audio is never sent to the internet.**
 
 ---
@@ -20,7 +20,7 @@ All processing happens locally using Whisper AI — **your audio is never sent t
 
 ### 1. Place the folder somewhere permanent
 
-Move the `voicedrop` folder to where you want to keep it (e.g. Documents, home folder).
+Move the `voicedrop` folder to where you want to keep it (e.g. `~/Documents`).
 
 > ⚠️ **Do not move the folder after installing.** The launcher will break if you do.
 
@@ -46,40 +46,58 @@ A Terminal window will open and automatically install:
 
 When you see **"Setup complete!"**, installation is finished.
 
-A `VoiceDrop Private.command` launcher with a microphone icon is automatically created on your **Desktop**.
+A `VoiceDrop Private.command` launcher is automatically created on your **Desktop**.
+
+---
+
+## Full Disk Access (required for iPhone Voice Memos)
+
+To enable automatic iPhone Voice Memos transcription, grant Full Disk Access to Terminal:
+
+1. System Settings → Privacy & Security → Full Disk Access
+2. Enable **Terminal**
+
+Then always launch VoiceDrop Private by double-clicking `VoiceDrop Private.command` (which opens in Terminal).
 
 ---
 
 ## Launching
 
 Double-click **`VoiceDrop Private.command`** on your Desktop.
-A Terminal window flashes briefly, then a 🎙️ icon appears in your menu bar.
+A Terminal window opens and a **VDP** icon appears in your menu bar.
 
-> On first launch, the Whisper model (~300MB) downloads automatically. This takes a few seconds.
+> On first launch, the Whisper model (~300MB) downloads automatically.
 
 ---
 
-## Usage
+## Features
 
 ### Live recording
 
 | Action | How |
 |---|---|
-| Start recording | Press **Right Option key** (or menu bar 🎙️ → Start Recording) |
+| Start recording | Press **Right Option key** (or menu bar → Start Recording) |
 | Stop recording | Press **Right Option key** again |
-| Result | Transcript is copied to clipboard automatically |
+| Result | Transcript is copied to clipboard and pasted automatically |
 
-The menu bar icon changes while recording. Each live recording stays as its own transcript. Open any text field and press Cmd+V to paste.
+Each live recording is saved as its own transcript file in `Desktop/VoiceDrop Private Transcripts/`.
 
----
+### iPhone Voice Memos — automatic transcription
 
-## Accessibility permission (first launch only)
+When Full Disk Access is enabled (see above), VoiceDrop Private automatically watches for new iPhone Voice Memos synced via iCloud.
 
-VoiceDrop Private needs Accessibility access to detect the Right Option key shortcut.
+- New recordings are detected within 3 seconds of syncing
+- Short memos (≤60 seconds) are bundled into a daily note: `Vault/01_Inbox/iPhone Voice Memos YYYY-MM-DD.md`
+- Long memos (>60 seconds) are saved as individual notes in `Vault/01_Inbox/`
+- Existing memos at startup are skipped — only new recordings are processed
 
-1. Click **Open System Settings** in the prompt
-2. Go to Privacy & Security → Accessibility
-3. Enable VoiceDrop Private (or Python)
+**Live recording always takes priority.** If a Voice Memo is being transcribed when you start a live recording, the import is paused and re-queued automatically after the live transcript completes.
+
+### Obsidian inbox — audio file transcription
+
+Drop any audio file into Obsidian's `01_Inbox` folder and it will be automatically transcribed to a `.md` note in the same folder.
+
+Supported formats: `.mp3` `.wav` `.m4a` `.aac` `.flac` `.caf` `.aiff`
 
 ---
 
@@ -87,52 +105,57 @@ VoiceDrop Private needs Accessibility access to detect the Right Option key shor
 
 | Item | Description |
 |---|---|
-| Start Recording | Start recording |
-| Stop Recording | Stop recording |
-| Open Transcripts Folder | Open the transcripts folder |
-| Model | Switch Whisper model (see below) |
+| Start / Stop Recording | Live recording controls |
+| Queue: idle / processing | Shows current transcription status |
+| Open Import Inbox | Open the manual import drop folder |
+| Open Obsidian Inbox | Open Obsidian's 01_Inbox in Finder |
+| Open Imported Jobs | Browse completed import transcripts |
+| Shortcut: Right Option | Shows shortcut permission status |
+| Open Transcripts Folder | Open all saved transcripts |
+| Copy Last Transcript | Copy the last transcript to clipboard |
+| Model | Switch Whisper model |
 | Quit | Quit VoiceDrop Private |
 
 ### Switching models
 
-Go to **Model** in the menu bar to choose:
-
 | Model | Memory | Notes |
 |---|---|---|
-| ✓ Small (~300MB, faster) | ~300MB | Default. Fast, accurate for most use cases |
-| Large v3 Turbo (~1.5GB, best accuracy) | ~1.5GB | Best accuracy for long recordings and technical terms |
-
-Switching models restarts VoiceDrop Private automatically. Both models are never loaded at the same time.
+| ✓ Small (~300MB, faster) | ~300MB | Default |
+| Large v3 Turbo (~1.5GB, best accuracy) | ~1.5GB | Best for long recordings |
 
 ---
 
 ## Troubleshooting
 
-**Install.command won't open (only shows "Move to Trash")**
+**Install.command won't open**
 → Use **right-click → Open** instead of double-clicking.
 
 **VoiceDrop Private doesn't launch**
 → Re-run `Install.command` to recreate the Desktop launcher.
-→ Make sure you haven't moved the `voicedrop` folder since installing.
+→ Make sure you haven't moved the folder since installing.
 
 **Right Option key doesn't respond**
-→ Check System Settings → Privacy & Security → Accessibility and make sure VoiceDrop Private (or Python) is enabled.
+→ System Settings → Privacy & Security → Accessibility → enable Python or VoiceDrop Private.
 
-**Transcription doesn't start**
-→ On first launch, the model is downloading. Wait a few seconds.
-→ While downloading, the menu bar shows "Loading...".
+**iPhone Voice Memos not being transcribed**
+→ Make sure Terminal has Full Disk Access (see above).
+→ Always launch via `VoiceDrop Private.command`, not directly from the folder.
 
-**Uninstalling**
-→ Drag the `voicedrop` folder to the Trash.
-→ Homebrew, Python, and ffmpeg remain (they may be shared with other apps).
+**Transcription spinner stuck**
+→ The menu bar shows `TX|` / `TX/` / `TX-` / `TX\` while processing. This is normal for long files.
 
 ---
 
 ## Changelog
 
-### v1.1.0 (2026-03-31)
-- **Reduced memory usage**: Default model switched from `whisper-large-v3-turbo` (~1.5GB) to `whisper-small-mlx` (~300MB) — roughly 1/4 the memory footprint
-- **Model switcher**: Switch between Small and Large v3 Turbo from the menu bar. Switching restarts the process so memory is fully released
+### v2.1.0 (2026-04-03)
+- **Live recording preempts imports**: Starting a live recording immediately interrupts any in-progress iPhone/Obsidian transcription; the interrupted job is re-queued and resumes after the live transcript completes
+- **Direct Terminal launch**: Removed LaunchAgent dependency — VoiceDrop Private now runs as a Terminal child process, inheriting Full Disk Access automatically
+- **iPhone Voice Memos auto-transcription**: New recordings detected within 3 seconds of iCloud sync; short memos bundled into daily Obsidian notes
+
+### v2.0.0 (2026-03-31)
+- **Reduced memory usage**: Default model switched to `whisper-small-mlx` (~300MB)
+- **Model switcher**: Switch between Small and Large v3 Turbo from the menu bar
 
 ### v1.0.0
-- Initial release
+- Initial private release
