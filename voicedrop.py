@@ -678,6 +678,26 @@ def normalize_transcript_text(
     return text
 
 
+def strip_trailing_repetition(text: str) -> str:
+    """末尾に繰り返しハルシネーションが付いていたら除去して返す。"""
+    for length in range(1, 20):
+        pattern = text[-length:] if len(text) >= length else None
+        if pattern is None:
+            break
+        # パターンが末尾から連続して6回以上繰り返されているか確認
+        repeat_len = length * 6
+        if len(text) < repeat_len:
+            continue
+        suffix = text[-repeat_len:]
+        if suffix == pattern * 6:
+            # 繰り返しが始まる位置を特定して除去
+            i = len(text) - length
+            while i >= length and text[i - length:i] == pattern:
+                i -= length
+            return text[:i].rstrip()
+    return text
+
+
 def is_filtered_hallucination(text: str) -> bool:
     collapsed = re.sub(r"[、。！？\s]+", "", text)
     if not collapsed:
@@ -1462,7 +1482,14 @@ class Transcriber:
                             normalized_text,
                         )
                         continue
-                    text = normalized_text
+                    stripped = strip_trailing_repetition(normalized_text)
+                    if stripped != normalized_text:
+                        LOGGER.warning(
+                            "Stripped trailing repetition hallucination: %r -> %r",
+                            normalized_text,
+                            stripped,
+                        )
+                    text = stripped
                     return text, language, backend_name, segments
                 errors.append(f"{backend_name}: empty transcript")
                 LOGGER.warning("Backend returned empty transcript: %s", backend_name)
@@ -1530,7 +1557,14 @@ class Transcriber:
                 raise NoSpeechDetectedError("No speech was detected in the recording.")
             if is_filtered_hallucination(normalized_text):
                 raise NoSpeechDetectedError("Hallucination filtered out.")
-            text = normalized_text
+            stripped = strip_trailing_repetition(normalized_text)
+            if stripped != normalized_text:
+                LOGGER.warning(
+                    "Stripped trailing repetition hallucination: %r -> %r",
+                    normalized_text,
+                    stripped,
+                )
+            text = stripped
 
         return text, language, "mlx-whisper", segments
 
