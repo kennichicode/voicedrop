@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import multiprocessing
 import numpy as np
 import rumps
 import sounddevice as sd
@@ -321,6 +322,36 @@ def format_duration_clock(seconds: float) -> str:
 
 class NoSpeechDetectedError(RuntimeError):
     pass
+
+
+class ImportPreemptedError(Exception):
+    pass
+
+
+def _mlx_transcribe_subprocess(
+    audio_path_str: str,
+    model_name: str,
+    language,
+    initial_prompt,
+    conn,
+) -> None:
+    try:
+        import mlx_whisper
+        result = mlx_whisper.transcribe(
+            audio_path_str,
+            path_or_hf_repo=model_name,
+            verbose=False,
+            language=language,
+            task="transcribe",
+            temperature=0.0,
+            condition_on_previous_text=False,
+            initial_prompt=initial_prompt,
+        )
+        conn.send(("ok", result))
+    except Exception as exc:
+        conn.send(("error", str(exc)))
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -1445,6 +1476,64 @@ class Transcriber:
             raise NoSpeechDetectedError("No speech was detected in the recording.")
         raise RuntimeError("All transcription backends failed: " + " | ".join(errors))
 
+    def transcribe_preemptible(
+        self, audio_path: Path, preempt_event: threading.Event
+    ) -> tuple[str, str, str, list]:
+        parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+        proc = multiprocessing.Process(
+            target=_mlx_transcribe_subprocess,
+            args=(str(audio_path), self.mlx_model_name, self.language, self.initial_prompt or None, child_conn),
+            daemon=True,
+        )
+        proc.start()
+        child_conn.close()
+
+        result_data = None
+        try:
+            while proc.is_alive():
+                if preempt_event.is_set():
+                    proc.terminate()
+                    proc.join(timeout=3)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=2)
+                    raise ImportPreemptedError("Import transcription preempted by live recording")
+                if parent_conn.poll(0.2):
+                    result_data = parent_conn.recv()
+                    break
+        finally:
+            parent_conn.close()
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=3)
+
+        if result_data is None:
+            raise RuntimeError("Transcription subprocess ended without result")
+
+        status, data = result_data
+        if status == "error":
+            raise RuntimeError(f"Transcription subprocess failed: {data}")
+
+        result = data
+        segments = [
+            {"start": s.get("start", 0.0), "end": s.get("end", 0.0), "text": s.get("text", "")}
+            for s in result.get("segments", [])
+        ]
+        text = str(result.get("text", "")).strip()
+        language = str(result.get("language", "unknown"))
+
+        if text:
+            normalized_text = normalize_transcript_text(text, language, glossary=self.term_glossary)
+            if normalized_text != text:
+                LOGGER.info("Normalized transcript output for %s", language)
+            if is_punctuation_only_transcript(normalized_text):
+                raise NoSpeechDetectedError("No speech was detected in the recording.")
+            if is_filtered_hallucination(normalized_text):
+                raise NoSpeechDetectedError("Hallucination filtered out.")
+            text = normalized_text
+
+        return text, language, "mlx-whisper", segments
+
 
 OBSIDIAN_PARAGRAPH_GAP_SECONDS = float(os.getenv("VOICEDROP_PARAGRAPH_GAP", "8.0"))
 
@@ -1876,6 +1965,7 @@ class VoiceDropApp(rumps.App):
         self._voice_memos_observations: dict[str, tuple[int, int]] = {}
         self._voice_memos_initialized, self._voice_memos_seen = load_voice_memos_state()
         self._voice_memos_permission_denied_logged = False
+        self._preempt_import_event = threading.Event()
         self._recording_transition_lock = threading.Lock()
         self._recording_transition: str | None = None
         self._recording_timer_lock = threading.Lock()
@@ -2238,6 +2328,10 @@ class VoiceDropApp(rumps.App):
             archive_path=archive_path,
         )
         self._enqueue_job(job)
+        with self._job_state_lock:
+            if self._active_job is not None and self._active_job.kind == "import":
+                LOGGER.info("Signaling import preemption for live recording")
+                self._preempt_import_event.set()
 
     def _enqueue_import_job(
         self,
@@ -2274,11 +2368,16 @@ class VoiceDropApp(rumps.App):
                 self._queued_job_count = max(0, self._queued_job_count - 1)
                 self._active_job = job
             AppHelper.callAfter(self._refresh_menu_state)
+            preempted_job: TranscriptionJob | None = None
             try:
                 if job.kind == "live":
+                    self._preempt_import_event.clear()
                     self._process_live_job(job)
                 else:
                     self._process_import_job(job)
+            except ImportPreemptedError:
+                preempted_job = job
+                LOGGER.info("Import job preempted, will re-queue: %s", job.audio_path)
             except Exception:
                 LOGGER.exception("Unexpected queued job failure: %s", job.kind)
             finally:
@@ -2289,6 +2388,16 @@ class VoiceDropApp(rumps.App):
                 if not self.recorder.is_recording:
                     AppHelper.callAfter(self._set_title, APP_MENU_TITLE)
                 AppHelper.callAfter(self._refresh_menu_state)
+            if preempted_job is not None:
+                LOGGER.info("Re-queuing preempted import: %s", preempted_job.audio_path)
+                self._enqueue_import_job(
+                    preempted_job.audio_path,
+                    preempted_job.stamp,
+                    output_inbox=preempted_job.output_inbox,
+                    source_path=preempted_job.source_path,
+                    import_source=preempted_job.import_source,
+                    aggregate_short_note=preempted_job.aggregate_short_note,
+                )
 
     def _import_watch_loop(self) -> None:
         while True:
@@ -2608,7 +2717,9 @@ class VoiceDropApp(rumps.App):
                 )
                 transcribe_path = wav_path
                 LOGGER.info("Converted %s to wav for transcription", original_source_path.name)
-            text, language, backend, segments = self.transcriber.transcribe(transcribe_path)
+            text, language, backend, segments = self.transcriber.transcribe_preemptible(
+                transcribe_path, self._preempt_import_event
+            )
             if not text:
                 raise NoSpeechDetectedError("No speech was detected in the imported file.")
 
@@ -2697,6 +2808,10 @@ class VoiceDropApp(rumps.App):
                     f"{output_dir.name} ({language}, {backend})",
                 )
             status = f"ok:{backend}:{language}"
+        except ImportPreemptedError:
+            LOGGER.info("Import preempted, file stays in processing: %s", source_path)
+            status = "preempted"
+            raise
         except NoSpeechDetectedError as exc:
             failed_dir = move_failed_import(source_path, job.stamp, str(exc))
             LOGGER.info("Imported audio discarded: %s", failed_dir)
