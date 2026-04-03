@@ -413,6 +413,21 @@ def normalize_transcript_text(
     return text
 
 
+def strip_trailing_repetition(text: str) -> str:
+    """末尾の繰り返しハルシネーションを除去して返す。"""
+    for length in range(1, 20):
+        if len(text) < length * 6:
+            continue
+        pattern = text[-length:]
+        suffix = text[-(length * 6):]
+        if suffix == pattern * 6:
+            i = len(text) - length
+            while i >= length and text[i - length:i] == pattern:
+                i -= length
+            return text[:i].rstrip()
+    return text
+
+
 def is_filtered_hallucination(text: str) -> bool:
     collapsed = re.sub(r"[、。！？\s]+", "", text)
     if not collapsed:
@@ -884,7 +899,14 @@ class Transcriber:
                             normalized_text,
                         )
                         continue
-                    text = normalized_text
+                    stripped = strip_trailing_repetition(normalized_text)
+                    if stripped != normalized_text:
+                        LOGGER.warning(
+                            "Stripped trailing repetition: %r -> %r",
+                            normalized_text,
+                            stripped,
+                        )
+                    text = stripped
                     return text, language, backend_name, segments
                 errors.append(f"{backend_name}: empty transcript")
                 LOGGER.warning("Backend returned empty transcript: %s", backend_name)
