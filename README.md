@@ -90,6 +90,32 @@ Desktop/VoiceDrop Transcripts/Import/Processed/(date)/
   └── meta.json
 ```
 
+### Auto-import iPhone Voice Memos
+
+VoiceDrop can also watch Apple Voice Memos directly here:
+
+```
+~/Library/Group Containers/group.com.apple.VoiceMemos.shared
+```
+
+Behavior:
+
+- On the first successful scan, existing memos are only registered as a baseline.
+- New iPhone Voice Memos are copied into VoiceDrop automatically.
+- Transcripts are written into Obsidian Inbox:
+
+```
+~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault/01_Inbox/
+```
+
+- Short memos of 1 minute or less are appended into a daily note such as:
+
+```
+01_Inbox/iPhone Voice Memos YYYY-MM-DD.md
+```
+
+macOS Full Disk Access is required for VoiceDrop (or Python) to read the protected Voice Memos folder.
+
 ---
 
 ## Accessibility permission (first launch only)

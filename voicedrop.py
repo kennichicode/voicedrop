@@ -69,6 +69,8 @@ IMPORT_PROCESSED_DIR = IMPORT_ROOT_DIR / "Processed"
 IMPORT_FAILED_DIR = IMPORT_ROOT_DIR / "Failed"
 OBSIDIAN_VAULT_DIR = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault"
 OBSIDIAN_INBOX_DIR = OBSIDIAN_VAULT_DIR / "01_Inbox"
+VOICE_MEMOS_SOURCE_DIR = Path.home() / "Library/Group Containers/group.com.apple.VoiceMemos.shared"
+VOICE_MEMOS_STATE_FILE = STATE_DIR / "voice_memos_state.json"
 TERM_GLOSSARY_FILE = APP_DIR / "transcription_terms.json"
 PID_FILE = STATE_DIR / "voicedrop.pid"
 LAST_TRANSCRIPT_FILE = STATE_DIR / "last_transcript.txt"
@@ -105,6 +107,13 @@ RESOURCE_LOG_INTERVAL_SECONDS = float(
 )
 RESOURCE_IDLE_SNAPSHOT_DELAY_SECONDS = float(
     os.getenv("VOICEDROP_RESOURCE_IDLE_SNAPSHOT_DELAY_SECONDS", "2.0")
+)
+VOICE_MEMOS_SHORT_MEMO_SECONDS = float(
+    os.getenv("VOICEDROP_VOICE_MEMOS_SHORT_SECONDS", "60.0")
+)
+VOICE_MEMOS_DAILY_NOTE_TITLE = os.getenv(
+    "VOICEDROP_VOICE_MEMOS_NOTE_TITLE",
+    "iPhone Voice Memos",
 )
 MAX_RECORDING_SECONDS = float(
     os.getenv("VOICEDROP_MAX_RECORDING_SECONDS", "3600")
@@ -670,6 +679,8 @@ class TranscriptionJob:
     source_path: Path | None = field(compare=False, default=None)
     archive_path: Path | None = field(compare=False, default=None)
     output_inbox: Path | None = field(compare=False, default=None)
+    import_source: str = field(compare=False, default="import")
+    aggregate_short_note: bool = field(compare=False, default=False)
 
 
 class ResourceMonitor:
@@ -1570,6 +1581,92 @@ def save_metadata(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def load_voice_memos_state() -> tuple[bool, dict[str, tuple[int, int]]]:
+    try:
+        payload = json.loads(VOICE_MEMOS_STATE_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False, {}
+    except Exception:
+        LOGGER.exception("Failed to load iPhone Voice Memos state")
+        return False, {}
+
+    raw_seen = payload.get("seen", {})
+    seen: dict[str, tuple[int, int]] = {}
+    if isinstance(raw_seen, dict):
+        for key, value in raw_seen.items():
+            if not isinstance(key, str) or not isinstance(value, (list, tuple)) or len(value) != 2:
+                continue
+            try:
+                seen[key] = (int(value[0]), int(value[1]))
+            except (TypeError, ValueError):
+                continue
+    return bool(payload.get("initialized")), seen
+
+
+def save_voice_memos_state(initialized: bool, seen: dict[str, tuple[int, int]]) -> None:
+    ensure_dirs()
+    payload = {
+        "initialized": initialized,
+        "seen": {key: [int(sig[0]), int(sig[1])] for key, sig in seen.items()},
+    }
+    temp_path = VOICE_MEMOS_STATE_FILE.with_suffix(".tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temp_path.replace(VOICE_MEMOS_STATE_FILE)
+
+
+def infer_segments_duration_seconds(segments: list) -> float:
+    starts: list[float] = []
+    ends: list[float] = []
+    for seg in segments:
+        try:
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", start))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        starts.append(start)
+        ends.append(max(start, end))
+    if not ends:
+        return 0.0
+    return max(0.0, max(ends) - min(starts or [0.0]))
+
+
+def append_obsidian_daily_note(
+    *,
+    note_dir: Path,
+    stamp: str,
+    source_name: str,
+    text: str,
+    segments: list,
+) -> Path:
+    note_dir.mkdir(parents=True, exist_ok=True)
+    if "_" in stamp:
+        date_part, time_part = stamp.split("_", 1)
+    else:
+        date_part, time_part = stamp, ""
+    title = f"{VOICE_MEMOS_DAILY_NOTE_TITLE} {date_part}"
+    note_path = note_dir / f"{title}.md"
+    clip_label = time_part.replace("-", ":") if time_part else stamp
+    source_label = Path(source_name).stem.strip()
+    entry_heading = f"## {clip_label}"
+    if source_label and source_label != clip_label:
+        entry_heading += f" {source_label}"
+
+    body = format_transcript_for_obsidian(text, segments).strip()
+    if not body:
+        body = text.strip()
+
+    note_exists = note_path.exists() and note_path.stat().st_size > 0
+    with note_path.open("a", encoding="utf-8") as handle:
+        if not note_exists:
+            handle.write(f"# {title}\n")
+        handle.write("\n\n")
+        handle.write(f"{entry_heading}\n\n{body}\n")
+    return note_path
+
+
 def reserve_import_processing_path(source_path: Path) -> tuple[str, Path]:
     ensure_dirs()
     stamp = utc_timestamp()
@@ -1763,6 +1860,9 @@ class VoiceDropApp(rumps.App):
         self._queued_import_paths: set[str] = set()
         self._import_observations: dict[str, tuple[int, int]] = {}
         self._obsidian_observations: dict[str, tuple[int, int]] = {}
+        self._voice_memos_observations: dict[str, tuple[int, int]] = {}
+        self._voice_memos_initialized, self._voice_memos_seen = load_voice_memos_state()
+        self._voice_memos_permission_denied_logged = False
         self._recording_transition_lock = threading.Lock()
         self._recording_transition: str | None = None
         self._recording_timer_lock = threading.Lock()
@@ -2126,7 +2226,16 @@ class VoiceDropApp(rumps.App):
         )
         self._enqueue_job(job)
 
-    def _enqueue_import_job(self, audio_path: Path, stamp: str, output_inbox: Path | None = None) -> None:
+    def _enqueue_import_job(
+        self,
+        audio_path: Path,
+        stamp: str,
+        output_inbox: Path | None = None,
+        *,
+        source_path: Path | None = None,
+        import_source: str = "import",
+        aggregate_short_note: bool = False,
+    ) -> None:
         key = str(audio_path)
         with self._job_state_lock:
             if key in self._queued_import_paths:
@@ -2138,8 +2247,10 @@ class VoiceDropApp(rumps.App):
             kind="import",
             audio_path=audio_path,
             stamp=stamp,
-            source_path=audio_path,
+            source_path=source_path or audio_path,
             output_inbox=output_inbox,
+            import_source=import_source,
+            aggregate_short_note=aggregate_short_note,
         )
         self._enqueue_job(job)
 
@@ -2169,6 +2280,10 @@ class VoiceDropApp(rumps.App):
     def _import_watch_loop(self) -> None:
         while True:
             try:
+                self._scan_voice_memos_source()
+            except Exception:
+                LOGGER.exception("iPhone Voice Memos scan failed")
+            try:
                 self._scan_import_inbox()
             except Exception:
                 LOGGER.exception("Import inbox scan failed")
@@ -2177,6 +2292,114 @@ class VoiceDropApp(rumps.App):
             except Exception:
                 LOGGER.exception("Obsidian inbox scan failed")
             time.sleep(IMPORT_SCAN_INTERVAL_SECONDS)
+
+    def _scan_voice_memos_source(self) -> None:
+        if not VOICE_MEMOS_SOURCE_DIR.exists():
+            return
+
+        observations: dict[str, tuple[int, int]] = {}
+        current_signatures: dict[str, tuple[int, int]] = {}
+        walk_errors: list[OSError] = []
+        state_dirty = False
+        now = time.time()
+
+        for dirpath, dirnames, filenames in os.walk(
+            VOICE_MEMOS_SOURCE_DIR,
+            onerror=lambda exc: walk_errors.append(exc),
+        ):
+            dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+            for filename in sorted(filenames):
+                path = Path(dirpath) / filename
+                if path.suffix.lower() not in SUPPORTED_IMPORT_EXTENSIONS:
+                    continue
+
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    continue
+
+                key = str(path)
+                signature = (int(stat.st_size), int(stat.st_mtime_ns))
+                previous = self._voice_memos_observations.get(key)
+                observations[key] = signature
+                current_signatures[key] = signature
+
+                if not self._voice_memos_initialized:
+                    continue
+                if self._voice_memos_seen.get(key) == signature:
+                    continue
+                if now - stat.st_mtime < IMPORT_STABILITY_SECONDS or previous != signature:
+                    continue
+
+                try:
+                    with open(path, "rb") as handle:
+                        handle.seek(0, 2)
+                        readable_size = handle.tell()
+                    if readable_size < stat.st_size:
+                        LOGGER.info(
+                            "iPhone Voice Memo not fully readable yet (%d/%d bytes): %s",
+                            readable_size,
+                            stat.st_size,
+                            path,
+                        )
+                        observations.pop(key, None)
+                        continue
+                except OSError:
+                    LOGGER.info(
+                        "iPhone Voice Memo not yet readable (permission or iCloud download in progress): %s",
+                        path,
+                    )
+                    observations.pop(key, None)
+                    continue
+
+                stamp, processing_path = reserve_import_processing_path(path)
+                try:
+                    shutil.copy2(path, processing_path)
+                except Exception:
+                    LOGGER.exception("Failed to copy iPhone Voice Memo into processing: %s", path)
+                    continue
+
+                LOGGER.info("Queued iPhone Voice Memo: %s", path)
+                self._voice_memos_seen[key] = signature
+                state_dirty = True
+                self._enqueue_import_job(
+                    processing_path,
+                    stamp,
+                    output_inbox=OBSIDIAN_INBOX_DIR,
+                    source_path=path,
+                    import_source="voice-memos",
+                    aggregate_short_note=True,
+                )
+                observations.pop(key, None)
+
+        if walk_errors:
+            if not self._voice_memos_permission_denied_logged:
+                LOGGER.warning(
+                    "iPhone Voice Memos source is not readable yet. Grant Full Disk Access to VoiceDrop or Python to enable direct import: %s",
+                    VOICE_MEMOS_SOURCE_DIR,
+                )
+                send_notification(
+                    "Voice Memos access needed",
+                    "Grant Full Disk Access to VoiceDrop or Python to auto-import iPhone Voice Memos.",
+                )
+                self._voice_memos_permission_denied_logged = True
+            return
+
+        self._voice_memos_permission_denied_logged = False
+        self._voice_memos_observations = observations
+
+        if not self._voice_memos_initialized:
+            self._voice_memos_seen.update(current_signatures)
+            self._voice_memos_initialized = True
+            save_voice_memos_state(self._voice_memos_initialized, self._voice_memos_seen)
+            LOGGER.info(
+                "Initialized iPhone Voice Memos watcher with %d existing file(s); new uploads will be auto-imported.",
+                len(current_signatures),
+            )
+            return
+
+        if state_dirty:
+            save_voice_memos_state(self._voice_memos_initialized, self._voice_memos_seen)
 
     def _scan_obsidian_inbox(self) -> None:
         if not OBSIDIAN_INBOX_DIR.exists():
@@ -2346,8 +2569,9 @@ class VoiceDropApp(rumps.App):
 
     def _process_import_job(self, job: TranscriptionJob) -> None:
         source_path = job.audio_path
+        original_source_path = job.source_path or source_path
         fallback_label = sanitize_filename_component(
-            source_path.stem,
+            original_source_path.stem,
             fallback="import",
             max_length=32,
         )
@@ -2357,7 +2581,7 @@ class VoiceDropApp(rumps.App):
         self.resource_monitor.begin_job(
             kind="import",
             stamp=job.stamp,
-            source=source_path.name,
+            source=original_source_path.name,
         )
         try:
             transcribe_path = source_path
@@ -2369,25 +2593,64 @@ class VoiceDropApp(rumps.App):
                     check=True,
                 )
                 transcribe_path = wav_path
-                LOGGER.info("Converted %s to wav for transcription", source_path.name)
+                LOGGER.info("Converted %s to wav for transcription", original_source_path.name)
             text, language, backend, segments = self.transcriber.transcribe(transcribe_path)
             if not text:
                 raise NoSpeechDetectedError("No speech was detected in the imported file.")
 
             label = build_transcript_label(text, fallback=fallback_label)
+            duration_seconds = infer_segments_duration_seconds(segments)
 
             if job.output_inbox is not None:
-                # Obsidian Inbox: write .md directly into the inbox, archive audio to Desktop
-                md_name = f"{job.stamp}_{sanitize_filename_component(label, fallback='import', max_length=64)}.md"
-                transcript_path = make_unique_path(job.output_inbox / md_name)
-                md_text = format_transcript_for_obsidian(text, segments)
-                transcript_path.write_text(md_text + "\n", encoding="utf-8")
+                if (
+                    job.aggregate_short_note
+                    and duration_seconds > 0.0
+                    and duration_seconds <= VOICE_MEMOS_SHORT_MEMO_SECONDS
+                ):
+                    transcript_path = append_obsidian_daily_note(
+                        note_dir=job.output_inbox,
+                        stamp=job.stamp,
+                        source_name=original_source_path.name,
+                        text=text,
+                        segments=segments,
+                    )
+                    LOGGER.info("Appended short iPhone Voice Memo transcript to %s", transcript_path)
+                    notification_title = "Voice Memo appended"
+                else:
+                    md_name = f"{job.stamp}_{sanitize_filename_component(label, fallback='import', max_length=64)}.md"
+                    transcript_path = make_unique_path(job.output_inbox / md_name)
+                    md_text = format_transcript_for_obsidian(text, segments)
+                    transcript_path.write_text(md_text + "\n", encoding="utf-8")
+                    LOGGER.info("Saved Obsidian transcript to %s", transcript_path)
+                    notification_title = (
+                        "Voice Memo transcript saved"
+                        if job.import_source == "voice-memos"
+                        else "Obsidian transcript saved"
+                    )
                 LAST_TRANSCRIPT_FILE.write_text(text, encoding="utf-8")
-                LOGGER.info("Saved Obsidian transcript to %s", transcript_path)
                 output_dir = make_unique_dir(IMPORT_PROCESSED_DIR / f"{job.stamp}_{label}")
                 archived_audio_path, mp3_ready = finalize_import_audio(source_path, output_dir)
+                save_metadata(
+                    output_dir / "meta.json",
+                    {
+                        "stamp": job.stamp,
+                        "language": language,
+                        "backend": backend,
+                        "source_name": original_source_path.name,
+                        "transcript_name": transcript_path.name,
+                        "transcript_path": str(transcript_path),
+                        "archived_audio": archived_audio_path.name,
+                        "mp3_ready": mp3_ready,
+                        "import_source": job.import_source,
+                        "aggregate_short_note": bool(
+                            job.aggregate_short_note
+                            and duration_seconds > 0.0
+                            and duration_seconds <= VOICE_MEMOS_SHORT_MEMO_SECONDS
+                        ),
+                    },
+                )
                 send_notification(
-                    "Obsidian transcript saved",
+                    notification_title,
                     f"{transcript_path.name} ({language}, {backend})",
                 )
             else:
@@ -2405,7 +2668,7 @@ class VoiceDropApp(rumps.App):
                         "stamp": job.stamp,
                         "language": language,
                         "backend": backend,
-                        "source_name": source_path.name,
+                        "source_name": original_source_path.name,
                         "transcript_name": transcript_path.name,
                         "archived_audio": archived_audio_path.name,
                         "mp3_ready": mp3_ready,
@@ -2719,8 +2982,10 @@ class VoiceDropApp(rumps.App):
 
     def scan_import_inbox_now(self, _) -> None:
         try:
+            self._scan_voice_memos_source()
             self._scan_import_inbox()
-            send_notification("Import scan complete", "Import/Inbox was scanned.")
+            self._scan_obsidian_inbox()
+            send_notification("Import scan complete", "All import sources were scanned.")
         except Exception as exc:
             LOGGER.exception("Manual import scan failed")
             send_notification("Import scan failed", str(exc))
