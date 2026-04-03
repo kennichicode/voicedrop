@@ -69,52 +69,7 @@ A Terminal window flashes briefly, then a 🎙️ icon appears in your menu bar.
 | Stop recording | Press **Right Option key** again |
 | Result | Transcript is copied to clipboard automatically |
 
-The menu bar icon changes while recording. Open any text field and press Cmd+V to paste.
-
-### Transcribe an audio file
-
-Drop an audio file into this folder:
-
-```
-Desktop/VoiceDrop Transcripts/Import/Inbox/
-```
-
-Supported formats: `.mp3` `.wav` `.m4a` `.aac` `.flac` `.ogg`
-
-Output is saved to:
-
-```
-Desktop/VoiceDrop Transcripts/Import/Processed/(date)/
-  ├── transcript.txt
-  ├── audio.mp3
-  └── meta.json
-```
-
-### Auto-import iPhone Voice Memos
-
-VoiceDrop can also watch Apple Voice Memos directly here:
-
-```
-~/Library/Group Containers/group.com.apple.VoiceMemos.shared
-```
-
-Behavior:
-
-- On the first successful scan, existing memos are only registered as a baseline.
-- New iPhone Voice Memos are copied into VoiceDrop automatically.
-- Transcripts are written into Obsidian Inbox:
-
-```
-~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault/01_Inbox/
-```
-
-- Short memos of 1 minute or less are appended into a daily note such as:
-
-```
-01_Inbox/iPhone Voice Memos YYYY-MM-DD.md
-```
-
-macOS Full Disk Access is required for VoiceDrop (or Python) to read the protected Voice Memos folder.
+The menu bar icon changes while recording. Each live recording stays as its own transcript. Open any text field and press Cmd+V to paste.
 
 ---
 

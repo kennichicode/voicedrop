@@ -2603,10 +2603,13 @@ class VoiceDropApp(rumps.App):
 
             if job.output_inbox is not None:
                 if (
-                    job.aggregate_short_note
+                    job.import_source == "voice-memos"
+                    and job.aggregate_short_note
                     and duration_seconds > 0.0
                     and duration_seconds <= VOICE_MEMOS_SHORT_MEMO_SECONDS
                 ):
+                    # Only imported iPhone Voice Memos are bundled into a daily note.
+                    # Live recordings always stay one recording -> one transcript.
                     transcript_path = append_obsidian_daily_note(
                         note_dir=job.output_inbox,
                         stamp=job.stamp,
@@ -2643,7 +2646,8 @@ class VoiceDropApp(rumps.App):
                         "mp3_ready": mp3_ready,
                         "import_source": job.import_source,
                         "aggregate_short_note": bool(
-                            job.aggregate_short_note
+                            job.import_source == "voice-memos"
+                            and job.aggregate_short_note
                             and duration_seconds > 0.0
                             and duration_seconds <= VOICE_MEMOS_SHORT_MEMO_SECONDS
                         ),
