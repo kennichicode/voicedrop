@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.voicedrop.agent</string>
+  <string>com.voicedrop.private.agent</string>
 
   <key>LimitLoadToSessionType</key>
   <array>
@@ -37,9 +37,9 @@
   </dict>
 
   <key>StandardOutPath</key>
-  <string>__HOME__/Library/Logs/VoiceDrop/launcher.log</string>
+  <string>__HOME__/Library/Logs/VoiceDrop Private/launcher.log</string>
 
   <key>StandardErrorPath</key>
-  <string>__HOME__/Library/Logs/VoiceDrop/launcher.log</string>
+  <string>__HOME__/Library/Logs/VoiceDrop Private/launcher.log</string>
 </dict>
 </plist>

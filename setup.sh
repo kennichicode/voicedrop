@@ -7,7 +7,7 @@ PYTHON_FORMULA="python@3.12"
 
 echo ""
 echo "================================================"
-echo "  VoiceDrop Installer"
+echo "  VoiceDrop Private Installer"
 echo "================================================"
 echo ""
 
@@ -81,7 +81,7 @@ chmod +x *.command 2>/dev/null || true
 xattr -dr com.apple.quarantine . 2>/dev/null || true
 
 # --- Desktop launcher ---
-DESKTOP_LAUNCHER="$HOME/Desktop/VoiceDrop.command"
+DESKTOP_LAUNCHER="$HOME/Desktop/VoiceDrop Private.command"
 echo "Creating Desktop launcher..."
 cat > "$DESKTOP_LAUNCHER" << SCRIPT
 #!/bin/zsh
@@ -108,6 +108,6 @@ echo "================================================"
 echo "  Setup complete!"
 echo "================================================"
 echo ""
-echo "Double-click 'VoiceDrop.command' on your Desktop to launch."
+echo "Double-click 'VoiceDrop Private.command' on your Desktop to launch."
 echo "The first launch downloads the Whisper model (~300MB)."
 echo ""

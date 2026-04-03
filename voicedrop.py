@@ -55,11 +55,13 @@ from Quartz import (
 from scipy.io.wavfile import write as write_wav
 
 
-APP_NAME = "VoiceDrop"
+APP_NAME = "VoiceDrop Private"
+APP_MENU_TITLE = "VDP"
 APP_DIR = Path(__file__).resolve().parent
-STATE_DIR = Path.home() / "Library/Application Support/VoiceDrop"
-LOG_DIR = Path.home() / "Library/Logs/VoiceDrop"
-TRANSCRIPTS_DIR = Path.home() / "Desktop/VoiceDrop Transcripts"
+LEGACY_STATE_DIR = Path.home() / "Library/Application Support/VoiceDrop"
+STATE_DIR = Path.home() / "Library/Application Support/VoiceDrop Private"
+LOG_DIR = Path.home() / "Library/Logs/VoiceDrop Private"
+TRANSCRIPTS_DIR = Path.home() / "Desktop/VoiceDrop Private Transcripts"
 ARCHIVED_AUDIO_DIR = TRANSCRIPTS_DIR / "Audio"
 IN_PROGRESS_AUDIO_DIR = ARCHIVED_AUDIO_DIR / "InProgress"
 IMPORT_ROOT_DIR = TRANSCRIPTS_DIR / "Import"
@@ -72,12 +74,13 @@ OBSIDIAN_INBOX_DIR = OBSIDIAN_VAULT_DIR / "01_Inbox"
 VOICE_MEMOS_SOURCE_DIR = Path.home() / "Library/Group Containers/group.com.apple.VoiceMemos.shared"
 VOICE_MEMOS_STATE_FILE = STATE_DIR / "voice_memos_state.json"
 TERM_GLOSSARY_FILE = APP_DIR / "transcription_terms.json"
-PID_FILE = STATE_DIR / "voicedrop.pid"
+PID_FILE = STATE_DIR / "voicedrop-private.pid"
 LAST_TRANSCRIPT_FILE = STATE_DIR / "last_transcript.txt"
 LAST_AUDIO_FILE = STATE_DIR / "last_recording.wav"
-LOG_FILE = LOG_DIR / "voicedrop.log"
+LOG_FILE = LOG_DIR / "voicedrop-private.log"
 RESOURCE_LOG_FILE = LOG_DIR / "resource.log"
 MODEL_PREF_FILE = STATE_DIR / "model_preference.txt"
+LEGACY_MODEL_PREF_FILE = LEGACY_STATE_DIR / "model_preference.txt"
 MODEL_OPTIONS = [
     ("mlx-community/whisper-small-mlx", "Small (~300MB, faster)"),
     ("mlx-community/whisper-large-v3-turbo", "Large v3 Turbo (~1.5GB, best accuracy)"),
@@ -216,6 +219,16 @@ def ensure_dirs() -> None:
     IMPORT_PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
     IMPORT_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     IMPORT_FAILED_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def migrate_private_state_from_legacy() -> None:
+    if MODEL_PREF_FILE.exists() or not LEGACY_MODEL_PREF_FILE.exists():
+        return
+    try:
+        MODEL_PREF_FILE.write_text(LEGACY_MODEL_PREF_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+        LOGGER.info("Migrated model preference from %s", LEGACY_MODEL_PREF_FILE)
+    except Exception:
+        LOGGER.exception("Failed to migrate legacy model preference from %s", LEGACY_MODEL_PREF_FILE)
 
 
 def setup_logging() -> None:
@@ -1091,7 +1104,7 @@ class AudioRecorder:
             raise RuntimeError("Recording already in progress")
         if self._backend_needs_reset:
             raise RuntimeError(
-                "Audio backend is recovering from a previous timeout. VoiceDrop will relaunch automatically."
+                f"Audio backend is recovering from a previous timeout. {APP_NAME} will relaunch automatically."
             )
 
         started_stamp = utc_timestamp()
@@ -1848,7 +1861,7 @@ class RightOptionEventTap:
 
 class VoiceDropApp(rumps.App):
     def __init__(self) -> None:
-        super().__init__(APP_NAME, title="VD", quit_button="Quit VoiceDrop")
+        super().__init__(APP_NAME, title=APP_MENU_TITLE, quit_button=f"Quit {APP_NAME}")
         self.recorder = AudioRecorder()
         self.transcriber = Transcriber()
         self.resource_monitor = ResourceMonitor()
@@ -1963,7 +1976,7 @@ class VoiceDropApp(rumps.App):
         self.resource_monitor.start()
         self._spinner_thread.start()
         log_resource_checkpoint("app-ready")
-        send_notification("Ready", "VoiceDrop is running in the menu bar.")
+        send_notification("Ready", f"{APP_NAME} is running in the menu bar.")
 
     def _set_title(self, value: str) -> None:
         self.title = value
@@ -2041,7 +2054,7 @@ class VoiceDropApp(rumps.App):
 
         send_notification(
             "Recording limit reached",
-            "VoiceDrop stopped automatically after 60 minutes.",
+            f"{APP_NAME} stopped automatically after 60 minutes.",
         )
         self._request_stop_recording(source="auto-stop")
 
@@ -2162,7 +2175,7 @@ class VoiceDropApp(rumps.App):
             LOGGER.warning("Right Option shortcut needs Accessibility permission")
             send_notification(
                 "Shortcut permission needed",
-                "Allow Accessibility for VoiceDrop/Python to use the Right Option shortcut.",
+                f"Allow Accessibility for {APP_NAME}/Python to use the Right Option shortcut.",
             )
             return
         self.shortcut_monitor.start()
@@ -2274,7 +2287,7 @@ class VoiceDropApp(rumps.App):
                         self._queued_import_paths.discard(str(job.audio_path))
                     self._active_job = None
                 if not self.recorder.is_recording:
-                    AppHelper.callAfter(self._set_title, "VD")
+                    AppHelper.callAfter(self._set_title, APP_MENU_TITLE)
                 AppHelper.callAfter(self._refresh_menu_state)
 
     def _import_watch_loop(self) -> None:
@@ -2375,12 +2388,13 @@ class VoiceDropApp(rumps.App):
         if walk_errors:
             if not self._voice_memos_permission_denied_logged:
                 LOGGER.warning(
-                    "iPhone Voice Memos source is not readable yet. Grant Full Disk Access to VoiceDrop or Python to enable direct import: %s",
+                    "iPhone Voice Memos source is not readable yet. Grant Full Disk Access to %s or Python to enable direct import: %s",
+                    APP_NAME,
                     VOICE_MEMOS_SOURCE_DIR,
                 )
                 send_notification(
                     "Voice Memos access needed",
-                    "Grant Full Disk Access to VoiceDrop or Python to auto-import iPhone Voice Memos.",
+                    f"Grant Full Disk Access to {APP_NAME} or Python to auto-import iPhone Voice Memos.",
                 )
                 self._voice_memos_permission_denied_logged = True
             return
@@ -2712,8 +2726,8 @@ class VoiceDropApp(rumps.App):
             )
             try:
                 send_notification(
-                    "VoiceDrop restarting",
-                    "Recording stop got stuck. VoiceDrop will relaunch automatically.",
+                    f"{APP_NAME} restarting",
+                    f"Recording stop got stuck. {APP_NAME} will relaunch automatically.",
                 )
             except Exception:
                 LOGGER.exception("Failed to send watchdog notification")
@@ -2735,11 +2749,11 @@ class VoiceDropApp(rumps.App):
             )
             AppHelper.callAfter(
                 self._fail_start_recording,
-                "Microphone start got stuck. VoiceDrop will relaunch automatically.",
+                f"Microphone start got stuck. {APP_NAME} will relaunch automatically.",
             )
             self._request_restart_when_idle(
                 "recording-start-timeout",
-                "Microphone start got stuck. VoiceDrop will relaunch automatically.",
+                f"Microphone start got stuck. {APP_NAME} will relaunch automatically.",
             )
 
         threading.Thread(
@@ -2752,13 +2766,14 @@ class VoiceDropApp(rumps.App):
         with self._restart_request_lock:
             if self._restart_requested:
                 LOGGER.info(
-                    "VoiceDrop restart already scheduled; ignoring duplicate reason=%s",
+                    "%s restart already scheduled; ignoring duplicate reason=%s",
+                    APP_NAME,
                     reason,
                 )
                 return
             self._restart_requested = True
 
-        LOGGER.warning("Scheduled VoiceDrop restart when idle: %s", reason)
+        LOGGER.warning("Scheduled %s restart when idle: %s", APP_NAME, reason)
 
         def watch() -> None:
             while True:
@@ -2767,9 +2782,9 @@ class VoiceDropApp(rumps.App):
                     and self._recording_transition_state() is None
                     and not self._has_pending_work()
                 ):
-                    LOGGER.error("Restarting VoiceDrop because %s", reason)
+                    LOGGER.error("Restarting %s because %s", APP_NAME, reason)
                     try:
-                        send_notification("VoiceDrop restarting", message)
+                        send_notification(f"{APP_NAME} restarting", message)
                     except Exception:
                         LOGGER.exception("Failed to send scheduled restart notification")
                     time.sleep(0.2)
@@ -2787,12 +2802,12 @@ class VoiceDropApp(rumps.App):
         self._clear_recording_transition()
         self._set_title(self._recording_title())
         self._refresh_menu_state()
-        send_notification("Recording", "VoiceDrop is recording from the microphone.")
+        send_notification("Recording", f"{APP_NAME} is recording from the microphone.")
 
     def _fail_start_recording(self, message: str) -> None:
         self._cancel_recording_timeout()
         self._clear_recording_transition()
-        self._set_title("VD")
+        self._set_title(APP_MENU_TITLE)
         self._refresh_menu_state()
         send_notification("Recording failed", message)
 
@@ -2804,14 +2819,14 @@ class VoiceDropApp(rumps.App):
     def _discard_stop_recording(self, message: str) -> None:
         self._cancel_recording_timeout()
         self._clear_recording_transition()
-        self._set_title("VD")
+        self._set_title(APP_MENU_TITLE)
         self._refresh_menu_state()
         send_notification("Discarded", message)
 
     def _fail_stop_recording(self, title: str, message: str) -> None:
         self._cancel_recording_timeout()
         self._clear_recording_transition()
-        self._set_title("VD")
+        self._set_title(APP_MENU_TITLE)
         self._refresh_menu_state()
         send_notification(title, message)
 
@@ -2823,7 +2838,7 @@ class VoiceDropApp(rumps.App):
             completed.set()
             AppHelper.callAfter(
                 self._fail_start_recording,
-                "VoiceDrop is already recording.",
+                f"{APP_NAME} is already recording.",
             )
             return
 
@@ -2836,7 +2851,7 @@ class VoiceDropApp(rumps.App):
             if self.recorder.backend_needs_reset:
                 self._request_restart_when_idle(
                     "audio-backend-reset-before-start",
-                    "Audio backend is recovering from a previous timeout. VoiceDrop will relaunch automatically.",
+                    f"Audio backend is recovering from a previous timeout. {APP_NAME} will relaunch automatically.",
                 )
             return
 
@@ -2868,7 +2883,7 @@ class VoiceDropApp(rumps.App):
         if result.backend_reset_required:
             restart_message = (
                 "Audio backend got stuck while closing the microphone stream. "
-                "VoiceDrop will relaunch automatically."
+                f"{APP_NAME} will relaunch automatically."
             )
 
         if result.duration_seconds < MIN_RECORDING_SECONDS or not result.segment_paths:
@@ -2920,7 +2935,7 @@ class VoiceDropApp(rumps.App):
 
     def _request_start_recording(self, source: str) -> None:
         if self.recorder.is_recording:
-            send_notification("Already recording", "VoiceDrop is already recording.")
+            send_notification("Already recording", f"{APP_NAME} is already recording.")
             return
         if not self._begin_recording_transition("starting"):
             LOGGER.info("Ignoring start request via %s during transition", source)
@@ -3027,7 +3042,7 @@ class VoiceDropApp(rumps.App):
         else:
             send_notification(
                 "Shortcut permission needed",
-                "Open System Settings and allow Accessibility for VoiceDrop/Python.",
+                f"Open System Settings and allow Accessibility for {APP_NAME}/Python.",
             )
 
     def request_shortcut_permission(self, _) -> None:
@@ -3037,7 +3052,7 @@ class VoiceDropApp(rumps.App):
         else:
             send_notification(
                 "Permission requested",
-                "Approve Accessibility for VoiceDrop/Python, then try Right Option again.",
+                f"Approve Accessibility for {APP_NAME}/Python, then try Right Option again.",
             )
         self._refresh_menu_state()
 
@@ -3058,7 +3073,7 @@ def ensure_single_instance() -> None:
         return
 
     if existing_pid != os.getpid() and is_process_alive(existing_pid):
-        LOGGER.info("VoiceDrop already running with PID %s", existing_pid)
+        LOGGER.info("%s already running with PID %s", APP_NAME, existing_pid)
         raise SystemExit(0)
 
     LOGGER.warning("Removing stale PID file for PID %s", existing_pid)
@@ -3072,7 +3087,7 @@ def main() -> int:
     except Exception:
         pass
 
-    parser = argparse.ArgumentParser(description="VoiceDrop menu bar recorder")
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} menu bar recorder")
     parser.add_argument("--self-check", action="store_true", help="print environment diagnostics")
     args = parser.parse_args()
 
@@ -3081,6 +3096,7 @@ def main() -> int:
 
     setup_logging()
     ensure_dirs()
+    migrate_private_state_from_legacy()
     ensure_single_instance()
     write_pid_file()
     atexit.register(remove_pid_file)

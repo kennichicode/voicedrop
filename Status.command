@@ -2,15 +2,15 @@
 cd "$(dirname "$0")"
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
-PID_FILE="$HOME/Library/Application Support/VoiceDrop/voicedrop.pid"
-LOG_FILE="$HOME/Library/Logs/VoiceDrop/voicedrop.log"
-RESOURCE_LOG_FILE="$HOME/Library/Logs/VoiceDrop/resource.log"
-AGENT_LABEL="com.voicedrop.agent"
+PID_FILE="$HOME/Library/Application Support/VoiceDrop Private/voicedrop-private.pid"
+LOG_FILE="$HOME/Library/Logs/VoiceDrop Private/voicedrop-private.log"
+RESOURCE_LOG_FILE="$HOME/Library/Logs/VoiceDrop Private/resource.log"
+AGENT_LABEL="com.voicedrop.private.agent"
 GUI_DOMAIN="gui/$(id -u)"
 
 echo ""
 echo "================================================"
-echo "  📊  VoiceDrop Status"
+echo "  📊  VoiceDrop Private Status"
 echo "================================================"
 echo ""
 

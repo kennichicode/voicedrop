@@ -3,4 +3,6 @@ __pycache__/
 *.pyo
 *.log
 .DS_Store
+venv/
 voicedrop.log
+voicedrop-private.log

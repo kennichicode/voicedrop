@@ -1,4 +1,4 @@
-# VoiceDrop
+# VoiceDrop Private
 
 A macOS menu bar app that transcribes your speech and copies it to the clipboard instantly.
 All processing happens locally using Whisper AI — **your audio is never sent to the internet.**
@@ -46,13 +46,13 @@ A Terminal window will open and automatically install:
 
 When you see **"Setup complete!"**, installation is finished.
 
-A `VoiceDrop.command` launcher with a microphone icon is automatically created on your **Desktop**.
+A `VoiceDrop Private.command` launcher with a microphone icon is automatically created on your **Desktop**.
 
 ---
 
 ## Launching
 
-Double-click **`VoiceDrop.command`** on your Desktop.
+Double-click **`VoiceDrop Private.command`** on your Desktop.
 A Terminal window flashes briefly, then a 🎙️ icon appears in your menu bar.
 
 > On first launch, the Whisper model (~300MB) downloads automatically. This takes a few seconds.
@@ -75,11 +75,11 @@ The menu bar icon changes while recording. Each live recording stays as its own 
 
 ## Accessibility permission (first launch only)
 
-VoiceDrop needs Accessibility access to detect the Right Option key shortcut.
+VoiceDrop Private needs Accessibility access to detect the Right Option key shortcut.
 
 1. Click **Open System Settings** in the prompt
 2. Go to Privacy & Security → Accessibility
-3. Enable VoiceDrop (or Python)
+3. Enable VoiceDrop Private (or Python)
 
 ---
 
@@ -91,7 +91,7 @@ VoiceDrop needs Accessibility access to detect the Right Option key shortcut.
 | Stop Recording | Stop recording |
 | Open Transcripts Folder | Open the transcripts folder |
 | Model | Switch Whisper model (see below) |
-| Quit | Quit VoiceDrop |
+| Quit | Quit VoiceDrop Private |
 
 ### Switching models
 
@@ -102,7 +102,7 @@ Go to **Model** in the menu bar to choose:
 | ✓ Small (~300MB, faster) | ~300MB | Default. Fast, accurate for most use cases |
 | Large v3 Turbo (~1.5GB, best accuracy) | ~1.5GB | Best accuracy for long recordings and technical terms |
 
-Switching models restarts VoiceDrop automatically. Both models are never loaded at the same time.
+Switching models restarts VoiceDrop Private automatically. Both models are never loaded at the same time.
 
 ---
 
@@ -111,12 +111,12 @@ Switching models restarts VoiceDrop automatically. Both models are never loaded 
 **Install.command won't open (only shows "Move to Trash")**
 → Use **right-click → Open** instead of double-clicking.
 
-**VoiceDrop doesn't launch**
+**VoiceDrop Private doesn't launch**
 → Re-run `Install.command` to recreate the Desktop launcher.
 → Make sure you haven't moved the `voicedrop` folder since installing.
 
 **Right Option key doesn't respond**
-→ Check System Settings → Privacy & Security → Accessibility and make sure VoiceDrop (or Python) is enabled.
+→ Check System Settings → Privacy & Security → Accessibility and make sure VoiceDrop Private (or Python) is enabled.
 
 **Transcription doesn't start**
 → On first launch, the model is downloading. Wait a few seconds.

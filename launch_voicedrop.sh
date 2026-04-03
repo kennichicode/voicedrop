@@ -5,14 +5,15 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON_BIN="$APP_DIR/venv/bin/python3"
 SCRIPT_PATH="$APP_DIR/voicedrop.py"
-AGENT_SOURCE="$APP_DIR/com.voicedrop.agent.plist"
+AGENT_SOURCE="$APP_DIR/com.voicedrop.private.agent.plist"
 AGENT_DIR="$HOME/Library/LaunchAgents"
-AGENT_PATH="$AGENT_DIR/com.voicedrop.agent.plist"
-AGENT_LABEL="com.voicedrop.agent"
+AGENT_PATH="$AGENT_DIR/com.voicedrop.private.agent.plist"
+AGENT_LABEL="com.voicedrop.private.agent"
+LEGACY_AGENT_PATH="$AGENT_DIR/com.voicedrop.agent.plist"
 GUI_DOMAIN="gui/$(id -u)"
-STATE_DIR="$HOME/Library/Application Support/VoiceDrop"
-LOG_DIR="$HOME/Library/Logs/VoiceDrop"
-PID_FILE="$STATE_DIR/voicedrop.pid"
+STATE_DIR="$HOME/Library/Application Support/VoiceDrop Private"
+LOG_DIR="$HOME/Library/Logs/VoiceDrop Private"
+PID_FILE="$STATE_DIR/voicedrop-private.pid"
 BOOT_LOG="$LOG_DIR/launcher.log"
 
 mkdir -p "$STATE_DIR" "$LOG_DIR" "$AGENT_DIR"
@@ -32,6 +33,11 @@ if [[ ! -f "$AGENT_SOURCE" ]]; then
   exit 1
 fi
 
+if [[ -f "$LEGACY_AGENT_PATH" ]] && grep -q "$APP_DIR" "$LEGACY_AGENT_PATH" 2>/dev/null; then
+  launchctl bootout "$GUI_DOMAIN" "$LEGACY_AGENT_PATH" >/dev/null 2>&1 || true
+  rm -f "$LEGACY_AGENT_PATH"
+fi
+
 if [[ ! -f "$AGENT_PATH" ]] || ! grep -q "$APP_DIR" "$AGENT_PATH" 2>/dev/null; then
   sed -e "s|__APP_DIR__|$APP_DIR|g" -e "s|__HOME__|$HOME|g" "$AGENT_SOURCE" > "$AGENT_PATH"
   launchctl bootout "$GUI_DOMAIN" "$AGENT_PATH" >/dev/null 2>&1 || true
@@ -46,7 +52,7 @@ if [[ -f "$PID_FILE" ]]; then
 fi
 
 timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-echo "$timestamp launching VoiceDrop" >> "$BOOT_LOG"
+echo "$timestamp launching VoiceDrop Private" >> "$BOOT_LOG"
 
 if ! launchctl print "$GUI_DOMAIN/$AGENT_LABEL" >/dev/null 2>&1; then
   launchctl bootstrap "$GUI_DOMAIN" "$AGENT_PATH" >> "$BOOT_LOG" 2>&1
