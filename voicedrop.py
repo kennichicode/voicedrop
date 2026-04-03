@@ -62,13 +62,6 @@ LOG_DIR = Path.home() / "Library/Logs/VoiceDrop"
 TRANSCRIPTS_DIR = Path.home() / "Desktop/VoiceDrop Transcripts"
 ARCHIVED_AUDIO_DIR = TRANSCRIPTS_DIR / "Audio"
 IN_PROGRESS_AUDIO_DIR = ARCHIVED_AUDIO_DIR / "InProgress"
-IMPORT_ROOT_DIR = TRANSCRIPTS_DIR / "Import"
-IMPORT_INBOX_DIR = IMPORT_ROOT_DIR / "Inbox"
-IMPORT_PROCESSING_DIR = IMPORT_ROOT_DIR / "Processing"
-IMPORT_PROCESSED_DIR = IMPORT_ROOT_DIR / "Processed"
-IMPORT_FAILED_DIR = IMPORT_ROOT_DIR / "Failed"
-OBSIDIAN_VAULT_DIR = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault"
-OBSIDIAN_INBOX_DIR = OBSIDIAN_VAULT_DIR / "01_Inbox"
 TERM_GLOSSARY_FILE = APP_DIR / "transcription_terms.json"
 PID_FILE = STATE_DIR / "voicedrop.pid"
 LAST_TRANSCRIPT_FILE = STATE_DIR / "last_transcript.txt"
@@ -85,8 +78,6 @@ RIGHT_OPTION_KEYCODE = 61
 SPINNER_FRAMES = ("TX|", "TX/", "TX-", "TX\\")
 RECORDING_SEGMENT_SECONDS = 1.0
 AUDIO_ARCHIVE_BITRATE = os.getenv("VOICEDROP_AUDIO_BITRATE", "192k")
-IMPORT_SCAN_INTERVAL_SECONDS = 3.0
-IMPORT_STABILITY_SECONDS = 2.0
 STOP_OPERATION_TIMEOUT_SECONDS = float(
     os.getenv("VOICEDROP_STOP_TIMEOUT_SECONDS", "5.0")
 )
@@ -152,18 +143,6 @@ HALLUCINATION_FILTER_PHRASES = {
     "ご視聴ありがとうございます",
     "ご視聴ありがとうございました",
 }
-SUPPORTED_IMPORT_EXTENSIONS = {
-    ".wav",
-    ".mp3",
-    ".m4a",
-    ".aac",
-    ".flac",
-    ".caf",
-    ".aiff",
-    ".aif",
-    ".m4b",
-}
-
 LOGGER = logging.getLogger(APP_NAME)
 
 
@@ -183,10 +162,6 @@ def ensure_dirs() -> None:
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     ARCHIVED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     IN_PROGRESS_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    IMPORT_INBOX_DIR.mkdir(parents=True, exist_ok=True)
-    IMPORT_PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
-    IMPORT_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    IMPORT_FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def setup_logging() -> None:
@@ -924,9 +899,6 @@ class Transcriber:
         raise RuntimeError("All transcription backends failed: " + " | ".join(errors))
 
 
-OBSIDIAN_PARAGRAPH_GAP_SECONDS = float(os.getenv("VOICEDROP_PARAGRAPH_GAP", "8.0"))
-
-
 def format_live_transcript(text: str, language: str, segments: list, glossary: dict[str, str] | None = None) -> str:
     base_text = normalize_transcript_text(text, language, glossary=glossary)
     is_japanese = language == "ja" or bool(JAPANESE_CHAR_PATTERN.search(base_text))
@@ -979,35 +951,6 @@ def format_live_transcript(text: str, language: str, segments: list, glossary: d
     if not re.search(r"[、。,.;:!?]", formatted) and "\n" not in formatted:
         return base_text
     return formatted
-
-
-def format_transcript_for_obsidian(text: str, segments: list) -> str:
-    if not segments:
-        return re.sub(r'([.!?。！？])\s+', r'\1\n', text)
-
-    lines: list[str] = []
-    current: list[str] = []
-    prev_end: float | None = None
-
-    for seg in segments:
-        seg_text = seg.get("text", "").strip()
-        if not seg_text:
-            prev_end = seg.get("end", prev_end)
-            continue
-        gap = seg["start"] - prev_end if prev_end is not None else 0.0
-        if prev_end is not None and gap >= OBSIDIAN_PARAGRAPH_GAP_SECONDS:
-            if current:
-                lines.append(re.sub(r'([.!?。！？])\s+', r'\1\n', " ".join(current)))
-                lines.append("")
-            current = [seg_text]
-        else:
-            current.append(seg_text)
-        prev_end = seg.get("end", prev_end)
-
-    if current:
-        lines.append(re.sub(r'([.!?。！？])\s+', r'\1\n', " ".join(current)))
-
-    return "\n".join(lines)
 
 
 def save_recording(recording: RecordingResult) -> tuple[Path, Path]:
@@ -1070,49 +1013,6 @@ def save_transcript(
 
 def save_metadata(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def reserve_import_processing_path(source_path: Path) -> tuple[str, Path]:
-    ensure_dirs()
-    stamp = utc_timestamp()
-    label = sanitize_filename_component(source_path.stem, fallback="import", max_length=32)
-    processing_path = make_unique_path(
-        IMPORT_PROCESSING_DIR / f"{stamp}_{label}{source_path.suffix.lower()}"
-    )
-    return stamp, processing_path
-
-
-def finalize_import_audio(source_path: Path, output_dir: Path) -> tuple[Path, bool]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if source_path.suffix.lower() == ".mp3":
-        final_path = output_dir / "audio.mp3"
-        shutil.move(str(source_path), str(final_path))
-        return final_path, True
-
-    final_mp3_path = output_dir / "audio.mp3"
-    try:
-        encode_mp3_archive(source_path, final_mp3_path)
-        if final_mp3_path.exists() and final_mp3_path.stat().st_size > 0:
-            source_path.unlink(missing_ok=True)
-            return final_mp3_path, True
-        raise RuntimeError("Encoded MP3 file is missing or empty")
-    except Exception:
-        LOGGER.exception("Failed to convert imported audio to MP3: %s", source_path)
-        original_path = output_dir / f"original{source_path.suffix.lower()}"
-        shutil.move(str(source_path), str(original_path))
-        final_mp3_path.unlink(missing_ok=True)
-        return original_path, False
-
-
-def move_failed_import(source_path: Path, stamp: str, reason: str) -> Path:
-    ensure_dirs()
-    label = sanitize_filename_component(source_path.stem, fallback="failed", max_length=32)
-    failed_dir = make_unique_dir(IMPORT_FAILED_DIR / f"{stamp}_{label}")
-    if source_path.exists():
-        destination = failed_dir / source_path.name
-        shutil.move(str(source_path), str(destination))
-    (failed_dir / "error.txt").write_text(reason + "\n", encoding="utf-8")
-    return failed_dir
 
 
 def run_self_check() -> int:
@@ -1260,9 +1160,6 @@ class VoiceDropApp(rumps.App):
         self._job_state_lock = threading.Lock()
         self._queued_job_count = 0
         self._active_job: TranscriptionJob | None = None
-        self._queued_import_paths: set[str] = set()
-        self._import_observations: dict[str, tuple[int, int]] = {}
-        self._obsidian_observations: dict[str, tuple[int, int]] = {}
         self._recording_transition_lock = threading.Lock()
         self._recording_transition: str | None = None
         self._recording_timer_lock = threading.Lock()
@@ -1279,17 +1176,8 @@ class VoiceDropApp(rumps.App):
             name="transcription-worker",
             daemon=True,
         )
-        self._import_watch_thread = threading.Thread(
-            target=self._import_watch_loop,
-            name="import-watch",
-            daemon=True,
-        )
-
         self.start_button = rumps.MenuItem("Start Recording", callback=self.start_recording)
         self.stop_button = rumps.MenuItem("Stop Recording", callback=self.stop_recording)
-        self.queue_status_button = rumps.MenuItem(
-            "Queue: idle", callback=self.scan_import_inbox_now
-        )
         self.shortcut_status_button = rumps.MenuItem(
             "Shortcut: Right Option (toggle)", callback=self.show_shortcut_help
         )
@@ -1298,18 +1186,6 @@ class VoiceDropApp(rumps.App):
         )
         self.open_transcripts_button = rumps.MenuItem(
             "Open Transcripts Folder", callback=self.open_transcripts
-        )
-        self.open_import_inbox_button = rumps.MenuItem(
-            "Open Import Inbox", callback=self.open_import_inbox
-        )
-        self.open_obsidian_inbox_button = rumps.MenuItem(
-            "Open Obsidian Inbox", callback=self.open_obsidian_inbox
-        )
-        self.open_import_processed_button = rumps.MenuItem(
-            "Open Imported Jobs", callback=self.open_import_processed
-        )
-        self.open_import_failed_button = rumps.MenuItem(
-            "Open Import Failed", callback=self.open_import_failed
         )
         self.open_logs_button = rumps.MenuItem("Open Logs", callback=self.open_logs)
         self.copy_last_button = rumps.MenuItem(
@@ -1334,12 +1210,6 @@ class VoiceDropApp(rumps.App):
             self.start_button,
             self.stop_button,
             None,
-            self.queue_status_button,
-            self.open_import_inbox_button,
-            self.open_obsidian_inbox_button,
-            self.open_import_processed_button,
-            self.open_import_failed_button,
-            None,
             self.shortcut_status_button,
             self.shortcut_permission_button,
             None,
@@ -1355,8 +1225,6 @@ class VoiceDropApp(rumps.App):
         self._refresh_menu_state()
         self._notify_recovery_sessions()
         self._worker_thread.start()
-        self._recover_pending_imports()
-        self._import_watch_thread.start()
         self.transcriber.start_warmup()
         self._spinner_thread.start()
         send_notification("Ready", "VoiceDrop is running in the menu bar.")
@@ -1489,13 +1357,6 @@ class VoiceDropApp(rumps.App):
             self.stop_button.title = (
                 "Stop Recording" if self.recorder.is_recording else "Stop Recording (inactive)"
             )
-        if active_job is None and queued_count == 0:
-            self.queue_status_button.title = "Queue: idle"
-        elif active_job is None:
-            self.queue_status_button.title = f"Queue: {queued_count} pending"
-        else:
-            active_label = "live" if active_job.kind == "live" else "import"
-            self.queue_status_button.title = f"Queue: {active_label} + {queued_count} pending"
         self.copy_last_button.title = (
             "Copy Last Transcript"
             if LAST_TRANSCRIPT_FILE.exists()
@@ -1572,32 +1433,6 @@ class VoiceDropApp(rumps.App):
             f"{len(sessions)} unfinished recording folder(s) are in Audio/InProgress.",
         )
 
-    def _recover_pending_imports(self) -> None:
-        try:
-            pending_files = sorted(
-                path
-                for path in IMPORT_PROCESSING_DIR.iterdir()
-                if path.is_file() and path.suffix.lower() in SUPPORTED_IMPORT_EXTENSIONS
-            )
-        except Exception:
-            LOGGER.exception("Failed to scan pending import files")
-            return
-
-        for path in pending_files:
-            self._enqueue_import_job(path, self._extract_stamp_from_name(path.name))
-
-        if pending_files:
-            send_notification(
-                "Recovered import jobs",
-                f"{len(pending_files)} audio file(s) were re-queued from Import/Processing.",
-            )
-
-    def _extract_stamp_from_name(self, name: str) -> str:
-        match = re.match(r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})", name)
-        if match:
-            return match.group(1)
-        return utc_timestamp()
-
     def _enqueue_job(self, job: TranscriptionJob) -> None:
         with self._job_state_lock:
             self._queued_job_count += 1
@@ -1615,23 +1450,6 @@ class VoiceDropApp(rumps.App):
         )
         self._enqueue_job(job)
 
-    def _enqueue_import_job(self, audio_path: Path, stamp: str, output_inbox: Path | None = None) -> None:
-        key = str(audio_path)
-        with self._job_state_lock:
-            if key in self._queued_import_paths:
-                return
-            self._queued_import_paths.add(key)
-        job = TranscriptionJob(
-            priority=10,
-            sequence=next(self._job_counter),
-            kind="import",
-            audio_path=audio_path,
-            stamp=stamp,
-            source_path=audio_path,
-            output_inbox=output_inbox,
-        )
-        self._enqueue_job(job)
-
     def _transcription_worker_loop(self) -> None:
         while True:
             job = self._job_queue.get()
@@ -1640,122 +1458,15 @@ class VoiceDropApp(rumps.App):
                 self._active_job = job
             AppHelper.callAfter(self._refresh_menu_state)
             try:
-                if job.kind == "live":
-                    self._process_live_job(job)
-                else:
-                    self._process_import_job(job)
+                self._process_live_job(job)
             except Exception:
                 LOGGER.exception("Unexpected queued job failure: %s", job.kind)
             finally:
                 with self._job_state_lock:
-                    if job.kind == "import":
-                        self._queued_import_paths.discard(str(job.audio_path))
                     self._active_job = None
                 if not self.recorder.is_recording:
                     AppHelper.callAfter(self._set_title, "VD")
                 AppHelper.callAfter(self._refresh_menu_state)
-
-    def _import_watch_loop(self) -> None:
-        while True:
-            try:
-                self._scan_import_inbox()
-            except Exception:
-                LOGGER.exception("Import inbox scan failed")
-            try:
-                self._scan_obsidian_inbox()
-            except Exception:
-                LOGGER.exception("Obsidian inbox scan failed")
-            time.sleep(IMPORT_SCAN_INTERVAL_SECONDS)
-
-    def _scan_obsidian_inbox(self) -> None:
-        if not OBSIDIAN_INBOX_DIR.exists():
-            return
-        observations: dict[str, tuple[int, int]] = {}
-        now = time.time()
-
-        for path in sorted(OBSIDIAN_INBOX_DIR.iterdir()):
-            if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMPORT_EXTENSIONS:
-                continue
-
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                continue
-
-            key = str(path)
-            signature = (int(stat.st_size), int(stat.st_mtime))
-            previous = self._obsidian_observations.get(key)
-            observations[key] = signature
-
-            if now - stat.st_mtime < IMPORT_STABILITY_SECONDS or previous != signature:
-                continue
-
-            try:
-                with open(path, "rb") as f:
-                    f.seek(0, 2)
-                    readable_size = f.tell()
-                if readable_size < stat.st_size:
-                    LOGGER.info("Obsidian audio not fully downloaded yet (%d/%d bytes): %s", readable_size, stat.st_size, path)
-                    observations.pop(key, None)
-                    continue
-            except OSError:
-                LOGGER.info("Obsidian audio not yet readable (iCloud download in progress): %s", path)
-                observations.pop(key, None)
-                continue
-
-            stamp, processing_path = reserve_import_processing_path(path)
-            try:
-                path.rename(processing_path)
-            except OSError:
-                try:
-                    shutil.move(str(path), str(processing_path))
-                except Exception:
-                    LOGGER.exception("Failed to move Obsidian audio into processing: %s", path)
-                    continue
-
-            LOGGER.info("Queued Obsidian audio: %s", processing_path)
-            self._enqueue_import_job(processing_path, stamp, output_inbox=OBSIDIAN_INBOX_DIR)
-            observations.pop(key, None)
-
-        self._obsidian_observations = observations
-
-    def _scan_import_inbox(self) -> None:
-        ensure_dirs()
-        observations: dict[str, tuple[int, int]] = {}
-        now = time.time()
-
-        for path in sorted(IMPORT_INBOX_DIR.iterdir()):
-            if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMPORT_EXTENSIONS:
-                continue
-
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                continue
-
-            key = str(path)
-            signature = (int(stat.st_size), int(stat.st_mtime))
-            previous = self._import_observations.get(key)
-            observations[key] = signature
-
-            if now - stat.st_mtime < IMPORT_STABILITY_SECONDS or previous != signature:
-                continue
-
-            stamp, processing_path = reserve_import_processing_path(path)
-            try:
-                path.rename(processing_path)
-            except OSError:
-                try:
-                    shutil.move(str(path), str(processing_path))
-                except Exception:
-                    LOGGER.exception("Failed to move import file into processing: %s", path)
-                    continue
-
-            LOGGER.info("Queued imported audio: %s", processing_path)
-            self._enqueue_import_job(processing_path, stamp)
-            observations.pop(key, None)
-
-        self._import_observations = observations
 
     def _rename_live_archive(self, archive_path: Path, stamp: str, label: str) -> Path:
         if not archive_path.exists():
@@ -1822,87 +1533,6 @@ class VoiceDropApp(rumps.App):
                     audio_path.unlink()
             except Exception:
                 LOGGER.exception("Failed to remove temp audio: %s", audio_path)
-
-    def _process_import_job(self, job: TranscriptionJob) -> None:
-        source_path = job.audio_path
-        fallback_label = sanitize_filename_component(
-            source_path.stem,
-            fallback="import",
-            max_length=32,
-        )
-        output_dir: Path | None = None
-        wav_path: Path | None = None
-        try:
-            transcribe_path = source_path
-            if source_path.suffix.lower() not in {".wav", ".mp3"}:
-                wav_path = source_path.with_suffix(".wav")
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", str(source_path), "-ar", "16000", "-ac", "1", str(wav_path)],
-                    capture_output=True,
-                    check=True,
-                )
-                transcribe_path = wav_path
-                LOGGER.info("Converted %s to wav for transcription", source_path.name)
-            text, language, backend, segments = self.transcriber.transcribe(transcribe_path)
-            if not text:
-                raise NoSpeechDetectedError("No speech was detected in the imported file.")
-
-            label = build_transcript_label(text, fallback=fallback_label)
-
-            if job.output_inbox is not None:
-                # Obsidian Inbox: write .md directly into the inbox, archive audio to Desktop
-                md_name = f"{job.stamp}_{sanitize_filename_component(label, fallback='import', max_length=64)}.md"
-                transcript_path = make_unique_path(job.output_inbox / md_name)
-                md_text = format_transcript_for_obsidian(text, segments)
-                transcript_path.write_text(md_text + "\n", encoding="utf-8")
-                LAST_TRANSCRIPT_FILE.write_text(text, encoding="utf-8")
-                LOGGER.info("Saved Obsidian transcript to %s", transcript_path)
-                output_dir = make_unique_dir(IMPORT_PROCESSED_DIR / f"{job.stamp}_{label}")
-                archived_audio_path, mp3_ready = finalize_import_audio(source_path, output_dir)
-                send_notification(
-                    "Obsidian transcript saved",
-                    f"{transcript_path.name} ({language}, {backend})",
-                )
-            else:
-                output_dir = make_unique_dir(IMPORT_PROCESSED_DIR / f"{job.stamp}_{label}")
-                transcript_path = save_transcript(
-                    text,
-                    stamp=job.stamp,
-                    label=label,
-                    directory=output_dir,
-                )
-                archived_audio_path, mp3_ready = finalize_import_audio(source_path, output_dir)
-                save_metadata(
-                    output_dir / "meta.json",
-                    {
-                        "stamp": job.stamp,
-                        "language": language,
-                        "backend": backend,
-                        "source_name": source_path.name,
-                        "transcript_name": transcript_path.name,
-                        "archived_audio": archived_audio_path.name,
-                        "mp3_ready": mp3_ready,
-                    },
-                )
-                send_notification(
-                    "Imported transcript saved",
-                    f"{output_dir.name} ({language}, {backend})",
-                )
-        except NoSpeechDetectedError as exc:
-            failed_dir = move_failed_import(source_path, job.stamp, str(exc))
-            LOGGER.info("Imported audio discarded: %s", failed_dir)
-            send_notification("Imported file discarded", failed_dir.name)
-        except Exception as exc:
-            if output_dir is not None and output_dir.exists() and not source_path.exists():
-                (output_dir / "error.txt").write_text(str(exc) + "\n", encoding="utf-8")
-                failed_dir = output_dir
-            else:
-                failed_dir = move_failed_import(source_path, job.stamp, str(exc))
-            LOGGER.exception("Imported transcription failed")
-            send_notification("Import failed", failed_dir.name)
-        finally:
-            if wav_path is not None and wav_path.exists():
-                wav_path.unlink(missing_ok=True)
 
     def _start_stop_watchdog(self, completed: threading.Event) -> None:
         def watch() -> None:
@@ -2080,26 +1710,6 @@ class VoiceDropApp(rumps.App):
 
     def open_transcripts(self, _) -> None:
         open_in_finder(TRANSCRIPTS_DIR)
-
-    def open_import_inbox(self, _) -> None:
-        open_in_finder(IMPORT_INBOX_DIR)
-
-    def open_obsidian_inbox(self, _) -> None:
-        open_in_finder(OBSIDIAN_INBOX_DIR)
-
-    def open_import_processed(self, _) -> None:
-        open_in_finder(IMPORT_PROCESSED_DIR)
-
-    def open_import_failed(self, _) -> None:
-        open_in_finder(IMPORT_FAILED_DIR)
-
-    def scan_import_inbox_now(self, _) -> None:
-        try:
-            self._scan_import_inbox()
-            send_notification("Import scan complete", "Import/Inbox was scanned.")
-        except Exception as exc:
-            LOGGER.exception("Manual import scan failed")
-            send_notification("Import scan failed", str(exc))
 
     def open_logs(self, _) -> None:
         open_in_finder(LOG_DIR)
