@@ -288,6 +288,15 @@ def utc_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
+def format_duration_clock(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    minutes, secs = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 class NoSpeechDetectedError(RuntimeError):
     pass
 
@@ -1016,6 +1025,13 @@ class AudioRecorder:
     @property
     def recording_stamp(self) -> str | None:
         return self._started_stamp
+
+    @property
+    def recording_elapsed_seconds(self) -> float:
+        started_at = self._started_at
+        if self._stream is None or started_at is None:
+            return 0.0
+        return max(0.0, time.time() - started_at)
 
     @property
     def backend_needs_reset(self) -> bool:
@@ -1937,8 +1953,12 @@ class VoiceDropApp(rumps.App):
                 time.sleep(0.1)
                 continue
             if self.recorder.is_recording:
+                AppHelper.callAfter(
+                    self._set_title,
+                    self._recording_title(),
+                )
                 index = 0
-                time.sleep(0.1)
+                time.sleep(0.5)
                 continue
             if self._has_pending_work():
                 AppHelper.callAfter(
@@ -1950,6 +1970,9 @@ class VoiceDropApp(rumps.App):
             else:
                 index = 0
                 time.sleep(0.2)
+
+    def _recording_title(self) -> str:
+        return f"REC {format_duration_clock(self.recorder.recording_elapsed_seconds)}"
 
     def _refresh_menu_state(self) -> None:
         shortcut_ready = self._shortcut_is_trusted() and self.shortcut_monitor.is_running
@@ -2495,7 +2518,7 @@ class VoiceDropApp(rumps.App):
     def _finish_start_recording(self) -> None:
         self._arm_recording_timeout()
         self._clear_recording_transition()
-        self._set_title("REC")
+        self._set_title(self._recording_title())
         self._refresh_menu_state()
         send_notification("Recording", "VoiceDrop is recording from the microphone.")
 
